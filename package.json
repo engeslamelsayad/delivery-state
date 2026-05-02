@@ -1,7 +1,7 @@
 {
   "name": "cod-meta-tracking",
-  "version": "3.0.0",
-  "description": "Easy Orders + Bosta + Meta CAPI — COD Tracking",
+  "version": "4.0.0",
+  "description": "Easy Orders + Bosta + Meta CAPI — COD Tracking with Redis",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
@@ -11,7 +11,8 @@
     "node": ">=18.0.0"
   },
   "dependencies": {
-    "express": "^4.18.2"
+    "express": "^4.18.2",
+    "ioredis": "^5.3.2"
   },
   "devDependencies": {
     "nodemon": "^3.0.2"
