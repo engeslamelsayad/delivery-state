@@ -7,7 +7,7 @@
 const SERVER_URL = 'https://delivery-state.up.railway.app'; 
 
 // ⚠️ ضع نفس الـ Secret الموجود في إعدادات المتجر لديك
-const EASY_ORDERS_SECRET = 'ضع_الرقم_السري_هنا'; 
+const EASY_ORDERS_SECRET = 'bjR2akgzSWkzWQ=='; 
 
 // بيانات العميل الوهمية للاختبار
 const testPhone = '01012345678';
