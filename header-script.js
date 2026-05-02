@@ -1,14 +1,3 @@
-/**
- * header-script.js
- * ================
- * يُضاف في Easy Orders: الإعدادات ← Custom Code ← Header
- *
- * يعمل على كل صفحة:
- *   1. يقرأ _fbp و _fbc من cookies المتصفح
- *   2. ينشئ sessionId فريد للزيارة
- *   3. يبعتهم للسيرفر عبر /collect-signals
- *   4. لو الصفحة /thanks?order_id=xxx — يربط الأوردر بالـ session تلقائياً
- */
 (function () {
   var SERVER = 'https://delivery-state.up.railway.app';
 
@@ -25,11 +14,22 @@
     return fbclid ? 'fb.1.' + Date.now() + '.' + fbclid : null;
   }
 
+  // localStorage مع try/catch لحماية متصفحات In-App Browser وIncognito
+  function lsGet(key) {
+    try { return localStorage.getItem(key); } catch (e) { return null; }
+  }
+  function lsSet(key, val) {
+    try { localStorage.setItem(key, val); } catch (e) {}
+  }
+  function lsDel(key) {
+    try { localStorage.removeItem(key); } catch (e) {}
+  }
+
   function getOrCreateSession() {
-    var sid = localStorage.getItem('_msid');
+    var sid = lsGet('_msid');
     if (!sid) {
       sid = 'ms_' + Math.random().toString(36).slice(2, 10) + '_' + Date.now();
-      localStorage.setItem('_msid', sid);
+      lsSet('_msid', sid);
     }
     return sid;
   }
@@ -48,7 +48,6 @@
     }
   }
 
-  // ── جمع الـ Signals وإرسالها (كل الصفحات) ──────────────
   var fbclid    = getFbclid();
   var sessionId = getOrCreateSession();
 
@@ -60,13 +59,12 @@
     pageUrl:   window.location.href,
   });
 
-  // ── ربط الأوردر (صفحة /thanks فقط) ─────────────────────
   var isThankYou = window.location.pathname.indexOf('thanks') !== -1;
   var orderId    = new URLSearchParams(window.location.search).get('order_id');
 
   if (isThankYou && orderId) {
     post('/link-session', { orderId: orderId, sessionId: sessionId });
-    setTimeout(function () { localStorage.removeItem('_msid'); }, 5000);
+    setTimeout(function () { lsDel('_msid'); }, 5000);
   }
 
 })();
