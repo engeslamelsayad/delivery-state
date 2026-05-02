@@ -202,7 +202,25 @@ app.post('/webhook/easy-orders', async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════
-// ENDPOINT 4 — POST /webhook/bosta
+// ENDPOINT 4 — POST /link-tracking
+// يربط trackingNumber بالـ orderId بعد إنشاء الشحنة يدوياً
+// Body: { orderId, trackingNumber }
+// ══════════════════════════════════════════════════════════
+app.post('/link-tracking', (req, res) => {
+  const { orderId, trackingNumber } = req.body;
+  if (!orderId || !trackingNumber) {
+    return res.status(400).json({ error: 'orderId and trackingNumber required' });
+  }
+  if (!orderStore.has(orderId)) {
+    return res.status(404).json({ error: 'orderId not found' });
+  }
+  trackingMap.set(String(trackingNumber), orderId);
+  console.log(`[Tracking] ${trackingNumber} linked to order ${orderId.slice(-8)}`);
+  res.json({ ok: true, trackingNumber, orderId });
+});
+
+// ══════════════════════════════════════════════════════════
+// ENDPOINT 5 — POST /webhook/bosta
 // يستقبل تحديثات حالة الشحنة من Bosta
 // هذا مصدر OrderDelivered الحقيقي في COD
 // ══════════════════════════════════════════════════════════
@@ -288,12 +306,9 @@ async function handleNewOrder(order, req) {
     userAgent: signals.userAgent,
   }, `purchase_${order.id}`);
 
-  // إنشاء شحنة Bosta
-  const shipment = await createBostaShipment(order);
-  if (shipment?.trackingNumber) {
-    trackingMap.set(String(shipment.trackingNumber), order.id);
-    console.log(`[Bosta] Shipment ${shipment.trackingNumber} ↔ order ${order.id.slice(-8)}`);
-  }
+  // ── الشحنة تُنشأ يدوياً على Bosta ──
+  // السيرفر سيستقبل التحديثات تلقائياً عبر /webhook/bosta
+  console.log(`[System] انتظار إنشاء الشحنة يدوياً على Bosta للأوردر ${order.id.slice(-8)}`);
 }
 
 async function handleBostaStatusUpdate(state, orderData) {
