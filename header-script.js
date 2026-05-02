@@ -10,7 +10,7 @@
  *   4. لو الصفحة /thanks?order_id=xxx — يربط الأوردر بالـ session تلقائياً
  */
 (function () {
-  var SERVER = 'https://YOUR-RAILWAY-URL.railway.app'; // ← غيّر بعد الـ Deploy
+  var SERVER = 'https://delivery-state.up.railway.app'; // ← غيّر بعد الـ Deploy
 
   function getCookie(name) {
     var m = document.cookie.match(new RegExp('(?:^|; )' + name + '=([^;]*)'));
