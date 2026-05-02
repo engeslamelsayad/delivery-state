@@ -202,24 +202,6 @@ app.post('/webhook/easy-orders', async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════
-// ENDPOINT 4 — POST /link-tracking
-// يربط trackingNumber بالـ orderId بعد إنشاء الشحنة يدوياً
-// Body: { orderId, trackingNumber }
-// ══════════════════════════════════════════════════════════
-app.post('/link-tracking', (req, res) => {
-  const { orderId, trackingNumber } = req.body;
-  if (!orderId || !trackingNumber) {
-    return res.status(400).json({ error: 'orderId and trackingNumber required' });
-  }
-  if (!orderStore.has(orderId)) {
-    return res.status(404).json({ error: 'orderId not found' });
-  }
-  trackingMap.set(String(trackingNumber), orderId);
-  console.log(`[Tracking] ${trackingNumber} linked to order ${orderId.slice(-8)}`);
-  res.json({ ok: true, trackingNumber, orderId });
-});
-
-// ══════════════════════════════════════════════════════════
 // ENDPOINT 5 — POST /webhook/bosta
 // يستقبل تحديثات حالة الشحنة من Bosta
 // هذا مصدر OrderDelivered الحقيقي في COD
@@ -240,11 +222,37 @@ app.post('/webhook/bosta', async (req, res) => {
 
   console.log(`[Bosta] ${trackingNumber} → ${state}`);
 
-  const orderId   = trackingMap.get(trackingNumber);
-  const orderData = orderId ? orderStore.get(orderId) : null;
+  // ── البحث عن الأوردر ─────────────────────────────────────
+  // محاولة 1: عبر trackingNumber (لو ربطناه قبل كده)
+  let orderId   = trackingMap.get(trackingNumber);
+  let orderData = orderId ? orderStore.get(orderId) : null;
+
+  // محاولة 2: عبر رقم الهاتف (الربط التلقائي)
+  if (!orderData) {
+    const bostaPhone = normalizePhone(
+      p.receiver?.phone ||
+      p.dropOffAddress?.phone ||
+      p.phone || ''
+    );
+
+    if (bostaPhone) {
+      for (const [id, data] of orderStore) {
+        if (normalizePhone(data.phone) === bostaPhone) {
+          orderData = data;
+          orderId   = id;
+          // احفظ الربط عشان المرة الجاية يكون أسرع
+          trackingMap.set(trackingNumber, id);
+          console.log(`[Bosta] ربط تلقائي عبر الهاتف: ${bostaPhone} → order ${id.slice(-8)}`);
+          break;
+        }
+      }
+    }
+  }
 
   if (!orderData) {
     console.warn(`[Bosta] مفيش أوردر للـ tracking: ${trackingNumber}`);
+    // احفظ الـ payload مؤقتاً لو الأوردر لم يصل بعد
+    signalStore.set('bosta_pending_' + trackingNumber, { p, state, ts: Date.now() });
     return;
   }
 
