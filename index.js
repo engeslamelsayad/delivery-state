@@ -12,19 +12,14 @@ const path    = require('path');
 
 const app = express();
 
-// ── Static Files — يخدّم header-script.js مباشرة ──────────
-// URL: https://your-server.com/header-script.js
-app.use(express.static(path.join(__dirname), {
-  // اخدم .js files فقط من الجذر
-  setHeaders: (res, filePath) => {
-    if (filePath.endsWith('.js')) {
-      res.setHeader('Content-Type', 'application/javascript');
-      res.setHeader('Cache-Control', 'public, max-age=3600'); // cache ساعة
-    }
-  }
-}));
-
 app.use(express.json());
+
+// ── Route مباشر لـ header-script.js ────────────────────────
+app.get('/header-script.js', (req, res) => {
+  res.setHeader('Content-Type', 'application/javascript');
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.sendFile(path.join(__dirname, 'header-script.js'));
+});
 
 // ── CORS ──────────────────────────────────────────────────
 const ALLOWED_ORIGINS = [
@@ -285,10 +280,34 @@ app.get('/health', (req, res) => res.json({
 async function handleNewOrder(order, req) {
   console.log(`[New Order] ${order.id.slice(-8)} — ${order.full_name} — ${order.total_cost} EGP`);
 
-  // ابحث عن الـ signals (لو link-session وصل قبل الـ webhook)
+  // ── البحث عن الـ signals بثلاث طرق ──────────────────────
+
+  // طريقة 1: link-session وصل قبل الـ webhook
   const linkRecord = signalStore.get('link_' + order.id);
   const sessionId  = linkRecord?.sessionId || null;
-  const signals    = sessionId ? (signalStore.get(sessionId) || {}) : {};
+  let signals      = sessionId ? (signalStore.get(sessionId) || {}) : {};
+
+  // طريقة 2: ابحث عن آخر signal وصل خلال آخر 3 دقائق
+  // (العميل فتح الصفحة ثم أكمل الطلب مباشرة)
+  if (!signals.fbp && !signals.fbc) {
+    const cutoff = Date.now() - (3 * 60 * 1000); // 3 دقائق
+    let   latest = null;
+    let   latestTs = 0;
+
+    for (const [key, val] of signalStore) {
+      // تجاهل records الـ link و bosta_pending
+      if (key.startsWith('link_') || key.startsWith('bosta_')) continue;
+      if (val.ts && val.ts > cutoff && val.ts > latestTs) {
+        latest   = val;
+        latestTs = val.ts;
+      }
+    }
+
+    if (latest) {
+      signals = latest;
+      console.log(`[Signals] تطابق بالوقت — آخر signal: ${Math.round((Date.now()-latestTs)/1000)}s مضت`);
+    }
+  }
 
   console.log(`[Signals] fbp:${signals.fbp?'✓':'✗'} fbc:${signals.fbc?'✓':'✗'} ip:${signals.clientIp?'✓':'✗'}`);
 
