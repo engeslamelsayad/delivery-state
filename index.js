@@ -330,7 +330,7 @@ async function handleBostaStatusUpdate(state, orderData) {
   if (isDelivered(state)) {
     console.log(`[Delivered] order ${orderId.slice(-8)} — ${totalCost} EGP محصّلة`);
 
-    await sendMetaEvent('OrderDelivered', {
+    await sendMetaEvent('Delivery', {
       order_id:       orderId,
       value:          totalCost,
       currency:       'EGP',
