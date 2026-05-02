@@ -26,10 +26,10 @@
   }
 
   function getOrCreateSession() {
-    var sid = sessionStorage.getItem('_msid');
+    var sid = localStorage.getItem('_msid');
     if (!sid) {
       sid = 'ms_' + Math.random().toString(36).slice(2, 10) + '_' + Date.now();
-      sessionStorage.setItem('_msid', sid);
+      localStorage.setItem('_msid', sid);
     }
     return sid;
   }
@@ -66,7 +66,7 @@
 
   if (isThankYou && orderId) {
     post('/link-session', { orderId: orderId, sessionId: sessionId });
-    setTimeout(function () { sessionStorage.removeItem('_msid'); }, 3000);
+    setTimeout(function () { localStorage.removeItem('_msid'); }, 5000);
   }
 
 })();
