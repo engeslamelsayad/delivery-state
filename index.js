@@ -27,10 +27,21 @@ app.use(express.static(path.join(__dirname), {
 app.use(express.json());
 
 // ── CORS ──────────────────────────────────────────────────
+const ALLOWED_ORIGINS = [
+  'https://www.cosmoeg.shop',
+  'https://cosmoeg.shop',
+  'https://www.eecm.shop',
+  'https://eecm.shop',
+];
+
 app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
+  const origin = req.headers.origin;
+  if (ALLOWED_ORIGINS.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+  }
   res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Credentials', 'false');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
@@ -294,25 +305,7 @@ async function handleNewOrder(order, req) {
     signals,
   });
 
-  // إرسال Purchase Event
-  await sendMetaEvent('Purchase', {
-    order_id:       order.id,
-    value:          order.total_cost,
-    currency:       'EGP',
-    content_ids:    order.cart_items?.map(i => i.product_id) || [],
-    content_type:   'product',
-    payment_method: 'cod',
-    num_items:      order.cart_items?.length || 1,
-  }, {
-    phone:     order.phone,
-    email:     order.email,
-    name:      order.full_name,
-    city:      order.government,
-    fbp:       signals.fbp,
-    fbc:       signals.fbc,
-    clientIp:  signals.clientIp || getClientIp(req),
-    userAgent: signals.userAgent,
-  }, `purchase_${order.id}`);
+  // Purchase يُبعث تلقائياً من Easy Orders عبر Pixel — لا نبعته هنا لتجنب التكرار
 
   // ── الشحنة تُنشأ يدوياً على Bosta ──
   // السيرفر سيستقبل التحديثات تلقائياً عبر /webhook/bosta
