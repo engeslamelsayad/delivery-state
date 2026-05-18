@@ -117,7 +117,7 @@ const store = {
 // Helpers
 const sha256 = v => v ? crypto.createHash('sha256').update(String(v).toLowerCase().trim()).digest('hex') : undefined;
 const normalizePhone = p => { if (!p) return p; const d = p.replace(/\D/g,''); if (d.startsWith('01')) return '2'+d; if (d.startsWith('201')) return d; return d; };
-const isDelivered = s => ['delivered','DELIVERED','45',45,'30',30,'RECEIVED_BY_CUSTOMER','WAITING_FOR_COLLECTION'].includes(s);
+const isDelivered = s => ['delivered','DELIVERED','45',45,'RECEIVED_BY_CUSTOMER'].includes(s);
 const isReturned  = s => ['returned','RETURNED','NOT_RECEIVED','WAITING_TO_RETURN','46',46,'47',47,'48',48,'RETURN_VERIFIED','CANCELLED'].includes(s);
 const calcDeliveryDays = c => Math.round((Date.now() - new Date(c).getTime()) / 86400000);
 const getClientIp = req => req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.headers['x-real-ip'] || req.socket?.remoteAddress || null;
