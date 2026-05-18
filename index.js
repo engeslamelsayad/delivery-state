@@ -117,8 +117,8 @@ const store = {
 // Helpers
 const sha256 = v => v ? crypto.createHash('sha256').update(String(v).toLowerCase().trim()).digest('hex') : undefined;
 const normalizePhone = p => { if (!p) return p; const d = p.replace(/\D/g,''); if (d.startsWith('01')) return '2'+d; if (d.startsWith('201')) return d; return d; };
-const isDelivered = s => ['delivered','DELIVERED','45',45,'RECEIVED_BY_CUSTOMER'].includes(s);
-const isReturned  = s => ['returned','RETURNED','NOT_RECEIVED','WAITING_TO_RETURN','46',46,'47',47,'RETURN_VERIFIED'].includes(s);
+const isDelivered = s => ['delivered','DELIVERED','45',45,'30',30,'RECEIVED_BY_CUSTOMER','WAITING_FOR_COLLECTION'].includes(s);
+const isReturned  = s => ['returned','RETURNED','NOT_RECEIVED','WAITING_TO_RETURN','46',46,'47',47,'48',48,'RETURN_VERIFIED','CANCELLED'].includes(s);
 const calcDeliveryDays = c => Math.round((Date.now() - new Date(c).getTime()) / 86400000);
 const getClientIp = req => req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.headers['x-real-ip'] || req.socket?.remoteAddress || null;
 
@@ -194,6 +194,23 @@ app.post('/webhook/bosta', async (req, res) => {
   }
 
   if (!orderData) {
+    // محاولة 3: اسأل Easy Orders API مباشرة برقم الهاتف
+    const bostaPhone2 = normalizePhone(
+      p.receiver?.phone || p.dropOffAddress?.phone || p.phone || ''
+    );
+    if (bostaPhone2) {
+      console.log(`[Bosta] البحث في Easy Orders بالهاتف: ${bostaPhone2}`);
+      orderData = await fetchOrderFromEasyOrders(bostaPhone2);
+      if (orderData) {
+        orderId = orderData.orderId;
+        await store.setOrder(orderId, orderData);
+        await store.setTracking(trackingNumber, orderId);
+        console.log(`[Bosta] وجد الأوردر من Easy Orders: ${orderId.slice(-8)}`);
+      }
+    }
+  }
+
+  if (!orderData) {
     console.warn(`[Bosta] no order for tracking: ${trackingNumber}`);
     await store.setSignal('bosta_pending_' + trackingNumber, { p, state, ts: Date.now() });
     return;
@@ -259,6 +276,31 @@ async function handleBostaStatusUpdate(state, orderData) {
     console.log(`[Returned] order ${orderId.slice(-8)}`);
     await sendMetaEvent('OrderReturned', { order_id: orderId, value: totalCost, currency: 'EGP', return_reason: state }, userData, `returned_${orderId}`);
     await updateEasyOrdersStatus(orderId, 'returned');
+  }
+}
+
+async function fetchOrderFromEasyOrders(phone) {
+  try {
+    const url = `${CONFIG.EASY_ORDERS_BASE}/external-apps/orders?store_id=${CONFIG.EASY_ORDERS_STORE_ID}&phone=${encodeURIComponent(phone)}&limit=5&sort=created_at&direction=desc`;
+    const res = await apiCall('GET', url, null, { 'Api-Key': CONFIG.EASY_ORDERS_API_KEY });
+    if (res.status !== 200 || !res.body?.data?.length) return null;
+
+    // خذ أحدث أوردر بنفس الرقم
+    const order = res.body.data[0];
+    return {
+      orderId:   order.id,
+      totalCost: order.total_cost,
+      phone:     order.phone,
+      email:     order.email     || null,
+      fullName:  order.full_name || '',
+      city:      order.government || '',
+      cartItems: order.cart_items || [],
+      createdAt: order.created_at || new Date().toISOString(),
+      signals:   {},
+    };
+  } catch (e) {
+    console.error('[EasyOrders] fetchOrder error:', e.message);
+    return null;
   }
 }
 
