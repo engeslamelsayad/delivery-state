@@ -196,8 +196,14 @@ app.post('/webhook/bosta', async (req, res) => {
   if (!orderData) {
     // محاولة 3: اسأل Easy Orders API مباشرة برقم الهاتف
     const bostaPhone2 = normalizePhone(
-      p.receiver?.phone || p.dropOffAddress?.phone || p.phone || ''
+      p.receiver?.phone || p.dropOffAddress?.phone || p.phone ||
+      p.receiver?.mobile || p.dropOffAddress?.mobile || p.mobile ||
+      p.consigneePhone || p.consignee?.phone || ''
     );
+    console.log(`[Bosta DEBUG] phone extracted: "${bostaPhone2}"`);
+    console.log(`[Bosta DEBUG] payload keys: ${Object.keys(p).join(', ')}`);
+    if (p.receiver) console.log(`[Bosta DEBUG] receiver keys: ${Object.keys(p.receiver).join(', ')}`);
+
     if (bostaPhone2) {
       console.log(`[Bosta] البحث في Easy Orders بالهاتف: ${bostaPhone2}`);
       orderData = await fetchOrderFromEasyOrders(bostaPhone2);
