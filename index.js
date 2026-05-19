@@ -117,8 +117,8 @@ const store = {
 // Helpers
 const sha256 = v => v ? crypto.createHash('sha256').update(String(v).toLowerCase().trim()).digest('hex') : undefined;
 const normalizePhone = p => { if (!p) return p; const d = p.replace(/\D/g,''); if (d.startsWith('01')) return '2'+d; if (d.startsWith('201')) return d; return d; };
-const isDelivered = s => ['delivered','DELIVERED','45',45,'RECEIVED_BY_CUSTOMER'].includes(s);
-const isReturned  = s => ['returned','RETURNED','NOT_RECEIVED','WAITING_TO_RETURN','46',46,'47',47,'48',48,'RETURN_VERIFIED','CANCELLED'].includes(s);
+const isDelivered = s => [45, '45', 'delivered', 'DELIVERED'].includes(s);
+const isReturned  = s => [46, '46', 48, '48', 49, '49', 100, '100', 101, '101', 'returned', 'RETURNED'].includes(s);
 const calcDeliveryDays = c => Math.round((Date.now() - new Date(c).getTime()) / 86400000);
 const getClientIp = req => req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.headers['x-real-ip'] || req.socket?.remoteAddress || null;
 
@@ -178,40 +178,37 @@ app.post('/webhook/bosta', async (req, res) => {
   let orderId   = await store.getTracking(trackingNumber);
   let orderData = orderId ? await store.getOrder(orderId) : null;
 
+  // Bosta webhook لا يحتوي على رقم الهاتف — نستدعي Bosta API
   if (!orderData) {
-    const bostaPhone = normalizePhone(p.receiver?.phone || p.dropOffAddress?.phone || p.phone || '');
-    if (bostaPhone) {
-      const allOrders = await store.getAllOrders();
-      for (const data of allOrders) {
-        if (normalizePhone(data.phone) === bostaPhone) {
-          orderData = data; orderId = data.orderId;
-          await store.setTracking(trackingNumber, orderId);
-          console.log(`[Bosta] auto-link by phone: ${bostaPhone} -> order ${orderId.slice(-8)}`);
-          break;
+    const bostaDelivery = await fetchBostaDelivery(trackingNumber);
+    if (bostaDelivery) {
+      const bostaPhone = normalizePhone(bostaDelivery.phone);
+      console.log(`[Bosta API] phone: ${bostaPhone}`);
+
+      if (bostaPhone) {
+        // محاولة 1: ابحث في Redis
+        const allOrders = await store.getAllOrders();
+        for (const data of allOrders) {
+          if (normalizePhone(data.phone) === bostaPhone) {
+            orderData = data;
+            orderId   = data.orderId;
+            await store.setTracking(trackingNumber, orderId);
+            console.log(`[Bosta] ربط من Redis: ${bostaPhone} -> order ${orderId.slice(-8)}`);
+            break;
+          }
         }
-      }
-    }
-  }
 
-  if (!orderData) {
-    // محاولة 3: اسأل Easy Orders API مباشرة برقم الهاتف
-    const bostaPhone2 = normalizePhone(
-      p.receiver?.phone || p.dropOffAddress?.phone || p.phone ||
-      p.receiver?.mobile || p.dropOffAddress?.mobile || p.mobile ||
-      p.consigneePhone || p.consignee?.phone || ''
-    );
-    console.log(`[Bosta DEBUG] phone extracted: "${bostaPhone2}"`);
-    console.log(`[Bosta DEBUG] payload keys: ${Object.keys(p).join(', ')}`);
-    if (p.receiver) console.log(`[Bosta DEBUG] receiver keys: ${Object.keys(p.receiver).join(', ')}`);
-
-    if (bostaPhone2) {
-      console.log(`[Bosta] البحث في Easy Orders بالهاتف: ${bostaPhone2}`);
-      orderData = await fetchOrderFromEasyOrders(bostaPhone2);
-      if (orderData) {
-        orderId = orderData.orderId;
-        await store.setOrder(orderId, orderData);
-        await store.setTracking(trackingNumber, orderId);
-        console.log(`[Bosta] وجد الأوردر من Easy Orders: ${orderId.slice(-8)}`);
+        // محاولة 2: لو مش موجود في Redis، اسأل Easy Orders API
+        if (!orderData) {
+          console.log(`[Bosta] البحث في Easy Orders بالهاتف: ${bostaPhone}`);
+          orderData = await fetchOrderFromEasyOrders(bostaPhone);
+          if (orderData) {
+            orderId = orderData.orderId;
+            await store.setOrder(orderId, orderData);
+            await store.setTracking(trackingNumber, orderId);
+            console.log(`[Bosta] وجد من Easy Orders: ${orderId.slice(-8)}`);
+          }
+        }
       }
     }
   }
@@ -282,6 +279,27 @@ async function handleBostaStatusUpdate(state, orderData) {
     console.log(`[Returned] order ${orderId.slice(-8)}`);
     await sendMetaEvent('OrderReturned', { order_id: orderId, value: totalCost, currency: 'EGP', return_reason: state }, userData, `returned_${orderId}`);
     await updateEasyOrdersStatus(orderId, 'returned');
+  }
+}
+
+async function fetchBostaDelivery(trackingNumber) {
+  try {
+    const url = `${CONFIG.BOSTA_BASE}/deliveries/business/${trackingNumber}`;
+    const res = await apiCall('GET', url, null, { 'Authorization': CONFIG.BOSTA_API_KEY });
+    if (res.status !== 200) {
+      console.warn(`[Bosta API] ${trackingNumber} -> ${res.status}`);
+      return null;
+    }
+    const d = res.body?.data || res.body;
+    return {
+      phone: d?.receiver?.phone || d?.receiver?.secondPhone || null,
+      receiver: d?.receiver || null,
+      businessReference: d?.businessReference || null,
+      cod: d?.cod || null,
+    };
+  } catch (e) {
+    console.error('[Bosta API] fetchDelivery error:', e.message);
+    return null;
   }
 }
 
