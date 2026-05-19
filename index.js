@@ -116,7 +116,8 @@ const store = {
 
 // Helpers
 const sha256 = v => v ? crypto.createHash('sha256').update(String(v).toLowerCase().trim()).digest('hex') : undefined;
-const normalizePhone = p => { if (!p) return p; const d = p.replace(/\D/g,''); if (d.startsWith('01')) return '2'+d; if (d.startsWith('201')) return d; return d; };
+const normalizePhone = p => { if (!p) return p; let d = p.replace(/\D/g,''); if (d.startsWith('20') && d.length === 12) d = d.slice(2); if (!d.startsWith('0') && d.length === 10) d = '0' + d; return d; };
+const phoneForMeta = p => { const n = normalizePhone(p); if (!n) return n; return n.startsWith('0') ? '2' + n : n; };
 const isDelivered = s => [45, '45', 'delivered', 'DELIVERED'].includes(s);
 const isReturned  = s => [46, '46', 48, '48', 49, '49', 100, '100', 101, '101', 'returned', 'RETURNED'].includes(s);
 const calcDeliveryDays = c => Math.round((Date.now() - new Date(c).getTime()) / 86400000);
@@ -337,7 +338,7 @@ async function sendMetaEvent(eventName, customData, userData, eventId) {
   const payload = { data: [{ event_name: eventName, event_time: Math.floor(Date.now()/1000), action_source: 'website', event_id: eventId,
     user_data: {
       em: userData.email ? [sha256(userData.email)] : undefined,
-      ph: userData.phone ? [sha256(normalizePhone(userData.phone))] : undefined,
+      ph: userData.phone ? [sha256(phoneForMeta(userData.phone))] : undefined,
       fn: userData.name  ? [sha256(userData.name.split(' ')[0])] : undefined,
       ln: userData.name  ? [sha256(userData.name.split(' ').slice(1).join(' '))] : undefined,
       ct: userData.city  ? [sha256(userData.city.toLowerCase())] : undefined,
