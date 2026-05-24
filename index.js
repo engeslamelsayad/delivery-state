@@ -36,6 +36,7 @@ app.use((req, res, next) => {
 const CONFIG = {
   EASY_ORDERS_SECRET:   process.env.EASY_ORDERS_SECRET   || '',
   EASY_ORDERS_API_KEY:  process.env.EASY_ORDERS_API_KEY  || '',
+  EASY_ORDERS_STORE_ID: process.env.EASY_ORDERS_STORE_ID || '',
   EASY_ORDERS_BASE:     'https://api.easy-orders.net/api/v1',
   BOSTA_API_KEY:        process.env.BOSTA_API_KEY        || '',
   BOSTA_BASE:           'https://app.bosta.co/api/v2',
