@@ -307,11 +307,21 @@ async function fetchBostaDelivery(trackingNumber) {
 async function fetchOrderFromEasyOrders(phone) {
   try {
     const url = `${CONFIG.EASY_ORDERS_BASE}/external-apps/orders?store_id=${CONFIG.EASY_ORDERS_STORE_ID}&phone=${encodeURIComponent(phone)}&limit=5&sort=created_at&direction=desc`;
+    console.log(`[EasyOrders DEBUG] URL: ${url}`);
     const res = await apiCall('GET', url, null, { 'Api-Key': CONFIG.EASY_ORDERS_API_KEY });
-    if (res.status !== 200 || !res.body?.data?.length) return null;
+    console.log(`[EasyOrders DEBUG] status: ${res.status}`);
+    console.log(`[EasyOrders DEBUG] body: ${JSON.stringify(res.body).slice(0, 500)}`);
+    if (res.status !== 200) return null;
 
-    // خذ أحدث أوردر بنفس الرقم
-    const order = res.body.data[0];
+    // الـ API قد يرجع البيانات في data أو orders أو نفس الـ root
+    const orders = res.body?.data || res.body?.orders || res.body?.results || (Array.isArray(res.body) ? res.body : null);
+    if (!orders || !orders.length) {
+      console.warn('[EasyOrders DEBUG] لا توجد أوردرات بهذا الرقم');
+      return null;
+    }
+    console.log(`[EasyOrders DEBUG] عدد الأوردرات: ${orders.length}`);
+
+    const order = orders[0];
     return {
       orderId:   order.id,
       totalCost: order.total_cost,
