@@ -375,22 +375,51 @@ const POLL_PAGE_LIMIT   = 50;                   // 50 شحنة لكل صفحة
 const POLL_MAX_PAGES    = 5;                    // حد أقصى 5 صفحات (250 شحنة)
 const PROCESSED_TTL     = 30 * 24 * 60 * 60;    // علامة المعالجة تبقى 30 يوم
 
+// محاولة العثور على endpoint الصحيح
+const POSSIBLE_LIST_URLS = [
+  (page, limit) => `${CONFIG.BOSTA_BASE}/deliveries/business?pageNumber=${page}&pageLimit=${limit}`,
+  (page, limit) => `${CONFIG.BOSTA_BASE}/deliveries?pageNumber=${page}&pageLimit=${limit}`,
+  (page, limit) => `${CONFIG.BOSTA_BASE}/deliveries/search?pageNumber=${page}&pageLimit=${limit}`,
+  (page, limit) => `${CONFIG.BOSTA_BASE}/deliveries/list?pageNumber=${page}&pageLimit=${limit}`,
+  (page, limit) => `${CONFIG.BOSTA_BASE}/business/deliveries?pageNumber=${page}&pageLimit=${limit}`,
+];
+let workingUrlBuilder = null;
+
 async function pollBostaDeliveries() {
   console.log('[Poll] ===== Starting Bosta poll =====');
   let totalProcessed = 0;
   let totalNew       = 0;
 
   try {
+    // اكتشاف الـ URL الصحيح في أول دورة
+    if (!workingUrlBuilder) {
+      for (const builder of POSSIBLE_LIST_URLS) {
+        const testUrl = builder(0, 5);
+        console.log(`[Poll] محاولة: ${testUrl}`);
+        const res = await apiCall('GET', testUrl, null, { 'Authorization': CONFIG.BOSTA_API_KEY });
+        console.log(`[Poll]   → status ${res.status}, body sample: ${JSON.stringify(res.body).slice(0, 200)}`);
+        if (res.status === 200 || res.status === 201) {
+          workingUrlBuilder = builder;
+          console.log(`[Poll] ✓ URL يعمل: ${testUrl}`);
+          break;
+        }
+      }
+      if (!workingUrlBuilder) {
+        console.error('[Poll] ❌ لم يُعثر على URL صحيح لـ Bosta API list endpoint');
+        return;
+      }
+    }
+
     for (let page = 0; page < POLL_MAX_PAGES; page++) {
-      const url = `${CONFIG.BOSTA_BASE}/deliveries?pageNumber=${page}&pageLimit=${POLL_PAGE_LIMIT}`;
+      const url = workingUrlBuilder(page, POLL_PAGE_LIMIT);
       const res = await apiCall('GET', url, null, { 'Authorization': CONFIG.BOSTA_API_KEY });
 
       if (res.status !== 200) {
-        console.warn(`[Poll] Bosta API returned ${res.status} on page ${page}`);
+        console.warn(`[Poll] page ${page} returned ${res.status}`);
         break;
       }
 
-      const deliveries = res.body?.data?.deliveries || res.body?.data || res.body?.list || [];
+      const deliveries = res.body?.data?.deliveries || res.body?.data || res.body?.list || res.body?.docs || (Array.isArray(res.body) ? res.body : []);
       if (!deliveries.length) {
         console.log(`[Poll] No more deliveries at page ${page}`);
         break;
