@@ -20,7 +20,7 @@ app.get('/header-script.js', (req, res) => {
 });
 
 const ALLOWED_ORIGINS = [
-  'https://www.trendoraeg.com/','https://trendoraeg.myeasyorders.com/',
+  'https://www.trendoraeg.com','https://trendoraeg.myeasyorders.com',
   'https://www.eecm.shop','https://eecm.shop',
 ];
 app.use((req, res, next) => {
