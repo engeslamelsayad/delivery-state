@@ -507,66 +507,36 @@ app.post('/admin/poll', (req, res) => {
 // ──────────────────────────────────────────────────────────
 
 /**
- * test-pagination.js
+ * test-page-size.js
  * ===================
- * يثبت قطعياً: هل Bosta pagination يعمل أم لا؟
- *
- * Usage: GET /admin/test-pagination
+ * نختبر أقصى pageLimit يدعمه Bosta API
  */
-
-app.get('/admin/test-pagination', async (req, res) => {
+app.get('/admin/test-page-size', async (req, res) => {
   const url = `${CONFIG.BOSTA_BASE}/deliveries/search`;
   const headers = { 'Authorization': CONFIG.BOSTA_API_KEY };
 
-  console.log(`\n===== [PAGINATION TEST] =====`);
-
-  const tests = [
-    { name: 'pageNumber:0',  body: { pageNumber: 0, pageLimit: 10 } },
-    { name: 'pageNumber:1',  body: { pageNumber: 1, pageLimit: 10 } },
-    { name: 'pageNumber:2',  body: { pageNumber: 2, pageLimit: 10 } },
-    { name: 'page:0',        body: { page: 0, limit: 10 } },
-    { name: 'page:1',        body: { page: 1, limit: 10 } },
-    { name: 'offset:0',      body: { offset: 0, limit: 10 } },
-    { name: 'offset:10',     body: { offset: 10, limit: 10 } },
-    { name: 'offset:20',     body: { offset: 20, limit: 10 } },
-    { name: 'skip:0',        body: { skip: 0, limit: 10 } },
-    { name: 'skip:10',       body: { skip: 10, limit: 10 } },
-    { name: 'from:0',        body: { from: 0, size: 10 } },
-    { name: 'from:10',       body: { from: 10, size: 10 } },
-  ];
-
+  const sizes = [50, 100, 200, 500, 1000, 2000];
   const results = [];
-  for (const t of tests) {
+
+  console.log(`\n===== [PAGE SIZE TEST] =====`);
+  for (const size of sizes) {
     try {
-      const r = await apiCall('POST', url, t.body, headers);
-      const deliveries = r.body?.data?.deliveries || [];
-      const firstIds = deliveries.slice(0, 3).map(d => d._id || d.trackingNumber);
-      console.log(`[PAG] ${t.name.padEnd(18)} count:${deliveries.length} first3: ${firstIds.join(', ')}`);
-      results.push({ name: t.name, body: t.body, count: deliveries.length, firstIds });
+      const t0 = Date.now();
+      const r = await apiCall('POST', url, { pageLimit: size }, headers);
+      const ms = Date.now() - t0;
+      const count = r.body?.data?.deliveries?.length || 0;
+      const total = r.body?.data?.count || r.body?.data?.totalCount || '?';
+      console.log(`[SIZE] pageLimit:${size} -> status:${r.status} count:${count} total:${total} time:${ms}ms`);
+      results.push({ requested: size, status: r.status, actual: count, total, ms });
     } catch (e) {
-      console.log(`[PAG] ${t.name} ERROR: ${e.message}`);
+      console.log(`[SIZE] pageLimit:${size} ERROR: ${e.message}`);
+      results.push({ requested: size, error: e.message });
     }
   }
 
-  // مقارنة: هل الـ first IDs مختلفة بين الصفحات؟
-  const findById = (name) => results.find(r => r.name === name)?.firstIds?.[0];
-  const pageNum0 = findById('pageNumber:0');
-  const pageNum1 = findById('pageNumber:1');
-  const offset0  = findById('offset:0');
-  const offset10 = findById('offset:10');
-
-  const verdict = {
-    pageNumber_works: pageNum0 && pageNum1 && pageNum0 !== pageNum1,
-    offset_works:     offset0  && offset10 && offset0  !== offset10,
-  };
-
-  console.log(`\n===== VERDICT =====`);
-  console.log(`pageNumber works: ${verdict.pageNumber_works ? '✓ YES' : '✗ NO'}`);
-  console.log(`offset works:     ${verdict.offset_works     ? '✓ YES' : '✗ NO'}`);
-  console.log(`===================\n`);
-
-  res.json({ verdict, results });
+  res.json({ results });
 });
+
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
