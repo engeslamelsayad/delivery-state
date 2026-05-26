@@ -368,56 +368,70 @@ async function sendMetaEvent(eventName, customData, userData, eventId) {
 }
 
 /**
- * test-bosta-phone-search.js
- * ===========================
- * ضع هذا الكود في endpoint مؤقت بسيرفرك لاختبار:
- * هل Bosta API يدعم البحث بالهاتف بأي طريقة؟
+ * test-bosta-search-v2.js
+ * ========================
+ * استكشاف دقيق لـ POST /deliveries/search:
+ * 1. هل يدعم pagination؟
+ * 2. ما هي الصيغة الصحيحة للـ filter بالهاتف؟
+ * 3. كم delivery يرجع في الصفحة الواحدة؟
  *
- * طريقة الاستخدام:
- *   1. ضع هذا الكود داخل index.js (قبل app.listen)
- *   2. ارفع على GitHub
- *   3. اضغط في المتصفح:
- *      https://your-app.up.railway.app/admin/test-bosta-search?phone=01234567890
- *      (استبدل الرقم برقم أوردر تعرف إنه موجود في Bosta)
- *   4. شوف الـ Deploy Logs — ستظهر النتائج لكل endpoint جُرّب
+ * Usage:
+ *   https://your-app.up.railway.app/admin/test-bosta-search-v2?phone=01234567890
  */
 
-app.get('/admin/test-bosta-search', async (req, res) => {
-  const phone = req.query.phone || '01234567890';
-  const results = [];
+app.get('/admin/test-bosta-search-v2', async (req, res) => {
+  const phone = req.query.phone || '01032609691';
+  const url = `${CONFIG.BOSTA_BASE}/deliveries/search`;
+  const headers = { 'Authorization': CONFIG.BOSTA_API_KEY };
 
-  console.log(`\n===== [TEST] Bosta phone search for ${phone} =====`);
+  console.log(`\n===== [TEST V2] Bosta search exploration =====`);
 
-  // قائمة الطرق المحتملة
-  const attempts = [
-    { method: 'GET',  path: `/deliveries/business?phone=${phone}` },
-    { method: 'GET',  path: `/deliveries?phone=${phone}` },
-    { method: 'GET',  path: `/deliveries/search?phone=${phone}` },
-    { method: 'GET',  path: `/deliveries/business?receiver.phone=${phone}` },
-    { method: 'POST', path: `/deliveries/search`, body: { phone } },
-    { method: 'POST', path: `/deliveries/search`, body: { 'receiver.phone': phone } },
-    { method: 'POST', path: `/deliveries/search`, body: { filters: { phone } } },
-    { method: 'POST', path: `/deliveries/business/search`, body: { phone } },
-    { method: 'GET',  path: `/business/deliveries?phone=${phone}` },
+  const tests = [
+    // Tests pagination
+    { name: 'Empty body',                   body: {} },
+    { name: 'pageNumber + pageLimit',       body: { pageNumber: 0, pageLimit: 5 } },
+    { name: 'page + limit',                 body: { page: 0, limit: 5 } },
+    { name: 'offset + limit',               body: { offset: 0, limit: 5 } },
+
+    // Tests filtering
+    { name: 'phone (direct)',               body: { phone: phone } },
+    { name: 'receiverPhone',                body: { receiverPhone: phone } },
+    { name: 'receiver.phone',               body: { 'receiver.phone': phone } },
+    { name: 'receiver object',              body: { receiver: { phone: phone } } },
+    { name: 'filters.phone',                body: { filters: { phone: phone } } },
+    { name: 'search.phone',                 body: { search: { phone: phone } } },
+    { name: 'query phone',                  body: { query: phone } },
+    { name: 'searchValue',                  body: { searchValue: phone } },
+    { name: 'mobilePhone',                  body: { mobilePhone: phone } },
   ];
 
-  for (const a of attempts) {
-    const url = `${CONFIG.BOSTA_BASE}${a.path}`;
+  const results = [];
+
+  for (const t of tests) {
     try {
-      const r = await apiCall(a.method, url, a.body || null, {
-        'Authorization': CONFIG.BOSTA_API_KEY
+      const r = await apiCall('POST', url, t.body, headers);
+      const data = r.body?.data;
+      const count = data?.deliveries?.length || data?.list?.length || 0;
+      const firstId = data?.deliveries?.[0]?._id || data?.deliveries?.[0]?.trackingNumber || 'N/A';
+      const firstPhone = data?.deliveries?.[0]?.receiver?.phone || 'N/A';
+
+      console.log(`[V2] ${t.name.padEnd(28)} → ${r.status} count:${count} first:${firstId} phone:${firstPhone}`);
+      results.push({
+        name: t.name, body: t.body, status: r.status,
+        count, firstId, firstPhone,
       });
-      const sample = JSON.stringify(r.body).slice(0, 150);
-      console.log(`[TEST] ${a.method} ${a.path} → ${r.status}: ${sample}`);
-      results.push({ method: a.method, path: a.path, status: r.status, sample });
     } catch (e) {
-      console.log(`[TEST] ${a.method} ${a.path} → ERROR: ${e.message}`);
-      results.push({ method: a.method, path: a.path, error: e.message });
+      console.log(`[V2] ${t.name} → ERROR: ${e.message}`);
+      results.push({ name: t.name, error: e.message });
     }
   }
 
-  console.log(`===== [TEST] Done =====\n`);
-  res.json({ phone, results });
+  console.log(`===== [TEST V2] Done =====\n`);
+  res.json({
+    phone,
+    summary: 'ابحث عن الـ test اللي رجع phone مطابق للـ phone اللي بعتته، أو count مختلف عن باقي الـ tests',
+    results,
+  });
 });
 
 const PORT = process.env.PORT || 3000;
