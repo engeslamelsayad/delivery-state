@@ -389,9 +389,6 @@ app.get('/admin/test-bosta-search-v2', async (req, res) => {
   const tests = [
     // Tests pagination
     { name: 'Empty body',                   body: {} },
-    // أضف هذا للـ test:
-{ name: 'pageLimit 200', body: { pageNumber: 0, pageLimit: 200 } },
-{ name: 'pageLimit 500', body: { pageNumber: 0, pageLimit: 500 } },
     { name: 'pageNumber + pageLimit',       body: { pageNumber: 0, pageLimit: 5 } },
     { name: 'page + limit',                 body: { page: 0, limit: 5 } },
     { name: 'offset + limit',               body: { offset: 0, limit: 5 } },
