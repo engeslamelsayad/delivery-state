@@ -505,6 +505,69 @@ app.post('/admin/poll', (req, res) => {
 });
 
 // ──────────────────────────────────────────────────────────
+
+/**
+ * test-pagination.js
+ * ===================
+ * يثبت قطعياً: هل Bosta pagination يعمل أم لا؟
+ *
+ * Usage: GET /admin/test-pagination
+ */
+
+app.get('/admin/test-pagination', async (req, res) => {
+  const url = `${CONFIG.BOSTA_BASE}/deliveries/search`;
+  const headers = { 'Authorization': CONFIG.BOSTA_API_KEY };
+
+  console.log(`\n===== [PAGINATION TEST] =====`);
+
+  const tests = [
+    { name: 'pageNumber:0',  body: { pageNumber: 0, pageLimit: 10 } },
+    { name: 'pageNumber:1',  body: { pageNumber: 1, pageLimit: 10 } },
+    { name: 'pageNumber:2',  body: { pageNumber: 2, pageLimit: 10 } },
+    { name: 'page:0',        body: { page: 0, limit: 10 } },
+    { name: 'page:1',        body: { page: 1, limit: 10 } },
+    { name: 'offset:0',      body: { offset: 0, limit: 10 } },
+    { name: 'offset:10',     body: { offset: 10, limit: 10 } },
+    { name: 'offset:20',     body: { offset: 20, limit: 10 } },
+    { name: 'skip:0',        body: { skip: 0, limit: 10 } },
+    { name: 'skip:10',       body: { skip: 10, limit: 10 } },
+    { name: 'from:0',        body: { from: 0, size: 10 } },
+    { name: 'from:10',       body: { from: 10, size: 10 } },
+  ];
+
+  const results = [];
+  for (const t of tests) {
+    try {
+      const r = await apiCall('POST', url, t.body, headers);
+      const deliveries = r.body?.data?.deliveries || [];
+      const firstIds = deliveries.slice(0, 3).map(d => d._id || d.trackingNumber);
+      console.log(`[PAG] ${t.name.padEnd(18)} count:${deliveries.length} first3: ${firstIds.join(', ')}`);
+      results.push({ name: t.name, body: t.body, count: deliveries.length, firstIds });
+    } catch (e) {
+      console.log(`[PAG] ${t.name} ERROR: ${e.message}`);
+    }
+  }
+
+  // مقارنة: هل الـ first IDs مختلفة بين الصفحات؟
+  const findById = (name) => results.find(r => r.name === name)?.firstIds?.[0];
+  const pageNum0 = findById('pageNumber:0');
+  const pageNum1 = findById('pageNumber:1');
+  const offset0  = findById('offset:0');
+  const offset10 = findById('offset:10');
+
+  const verdict = {
+    pageNumber_works: pageNum0 && pageNum1 && pageNum0 !== pageNum1,
+    offset_works:     offset0  && offset10 && offset0  !== offset10,
+  };
+
+  console.log(`\n===== VERDICT =====`);
+  console.log(`pageNumber works: ${verdict.pageNumber_works ? '✓ YES' : '✗ NO'}`);
+  console.log(`offset works:     ${verdict.offset_works     ? '✓ YES' : '✗ NO'}`);
+  console.log(`===================\n`);
+
+  res.json({ verdict, results });
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`\nCOD Meta Tracking v5.0 -- Port ${PORT}`);
