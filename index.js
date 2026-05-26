@@ -1,7 +1,12 @@
 /**
- * index.js — COD Meta Tracking System v4.0
- * ==========================================
- * Easy Orders + Bosta + Meta CAPI + Redis
+ * index.js — COD Meta Tracking System v5.0
+ * ============================================
+ * فلسفة جديدة: Bosta = مصدر التسليم، Redis = طبقة التحسين
+ *
+ * - كل شحنة في Bosta تبعت Event لـ Meta (سواء عرفنا الأوردر أم لا)
+ * - Easy Orders Webhook يحفظ بيانات إضافية (email, fbp, fbc, content_ids) في Redis
+ * - لما تتسلّم الشحنة: نأخذ phone/name/city/value من Bosta + email/fbp/fbc من Redis
+ * - نتيجة: تغطية 100% + EMQ عالي لما نملك بيانات إضافية
  */
 
 const express = require('express');
@@ -35,21 +40,21 @@ app.use((req, res, next) => {
 
 const CONFIG = {
   EASY_ORDERS_SECRET:   process.env.EASY_ORDERS_SECRET   || '',
-  EASY_ORDERS_API_KEY:  process.env.EASY_ORDERS_API_KEY  || '',
-  EASY_ORDERS_STORE_ID: process.env.EASY_ORDERS_STORE_ID || '',
-  EASY_ORDERS_BASE:     'https://api.easy-orders.net/api/v1',
   BOSTA_API_KEY:        process.env.BOSTA_API_KEY        || '',
   BOSTA_BASE:           'https://app.bosta.co/api/v2',
   META_PIXEL_ID:        process.env.META_PIXEL_ID        || '',
   META_CAPI_TOKEN:      process.env.META_CAPI_TOKEN      || '',
   META_CAPI_BASE:       'https://graph.facebook.com/v19.0',
   REDIS_URL:            process.env.REDIS_URL            || '',
-  SIGNAL_TTL:    4  * 60 * 60,
-  ORDER_TTL:     10 * 24 * 60 * 60,
-  TRACKING_TTL:  10 * 24 * 60 * 60,
+  SIGNAL_TTL:    4  * 60 * 60,        // 4 ساعات
+  ORDER_TTL:     30 * 24 * 60 * 60,   // 30 يوم (أطول لأن دورة التسليم قد تطول)
+  TRACKING_TTL:  30 * 24 * 60 * 60,
+  PROCESSED_TTL: 30 * 24 * 60 * 60,
 };
 
+// ──────────────────────────────────────────────────────────
 // Redis
+// ──────────────────────────────────────────────────────────
 let redis = null;
 function getRedis() {
   if (!redis && CONFIG.REDIS_URL) {
@@ -59,7 +64,6 @@ function getRedis() {
   }
   return redis;
 }
-
 async function rSet(key, value, ttl) {
   try { await getRedis()?.set(key, JSON.stringify(value), 'EX', ttl); } catch(e) {}
 }
@@ -73,7 +77,7 @@ async function rKeys(pattern) {
   try { return await getRedis()?.keys(pattern) || []; } catch(e) { return []; }
 }
 
-// In-Memory Fallback
+// Memory fallback
 const mem = { signals: new Map(), orders: new Map(), tracking: new Map() };
 setInterval(() => {
   const cutoff = Date.now() - CONFIG.SIGNAL_TTL * 1000;
@@ -107,22 +111,38 @@ const store = {
     }
     return Array.from(mem.signals.entries()).map(([key, val]) => ({ key, val }));
   },
-  async scanSignals(prefix) {
-    const all = await this.getAllSignals();
-    return all.filter(({ key }) => key.startsWith(prefix));
-  },
   async orderCount()   { return getRedis() ? (await rKeys('order:*')).length   : mem.orders.size; },
   async trackingCount(){ return getRedis() ? (await rKeys('track:*')).length   : mem.tracking.size; },
 };
 
+// ──────────────────────────────────────────────────────────
 // Helpers
+// ──────────────────────────────────────────────────────────
 const sha256 = v => v ? crypto.createHash('sha256').update(String(v).toLowerCase().trim()).digest('hex') : undefined;
-const normalizePhone = p => { if (!p) return p; let d = p.replace(/\D/g,''); if (d.startsWith('20') && d.length === 12) d = d.slice(2); if (!d.startsWith('0') && d.length === 10) d = '0' + d; return d; };
-const phoneForMeta = p => { const n = normalizePhone(p); if (!n) return n; return n.startsWith('0') ? '2' + n : n; };
+
+// طبّع لرقم محلي 01xxx للمقارنة
+const normalizePhone = p => {
+  if (!p) return p;
+  let d = p.replace(/\D/g, '');
+  if (d.startsWith('20') && d.length === 12) d = d.slice(2);
+  if (!d.startsWith('0') && d.length === 10) d = '0' + d;
+  return d;
+};
+
+// E.164 لـ Meta (201xxxxxxxxx بدون +)
+const phoneForMeta = p => {
+  const n = normalizePhone(p);
+  if (!n) return n;
+  return n.startsWith('0') ? '2' + n : n;
+};
+
 const isDelivered = s => [45, '45', 'delivered', 'DELIVERED'].includes(s);
 const isReturned  = s => [46, '46', 48, '48', 49, '49', 100, '100', 101, '101', 'returned', 'RETURNED'].includes(s);
-const calcDeliveryDays = c => Math.round((Date.now() - new Date(c).getTime()) / 86400000);
-const getClientIp = req => req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.headers['x-real-ip'] || req.socket?.remoteAddress || null;
+
+const getClientIp = req =>
+  req.headers['x-forwarded-for']?.split(',')[0]?.trim() ||
+  req.headers['x-real-ip'] ||
+  req.socket?.remoteAddress || null;
 
 function apiCall(method, url, body, headers = {}) {
   return new Promise((resolve, reject) => {
@@ -142,95 +162,97 @@ function apiCall(method, url, body, headers = {}) {
   });
 }
 
+// ══════════════════════════════════════════════════════════
 // ENDPOINTS
+// ══════════════════════════════════════════════════════════
+
+// 1) /collect-signals — يستقبل fbp/fbc من المتصفح
 app.post('/collect-signals', async (req, res) => {
   const { sessionId, fbp, fbc, userAgent, pageUrl } = req.body;
   if (!sessionId) return res.status(400).json({ error: 'sessionId required' });
-  await store.setSignal(sessionId, { fbp: fbp||null, fbc: fbc||null, clientIp: getClientIp(req), userAgent: userAgent||req.headers['user-agent']||null, pageUrl: pageUrl||null, ts: Date.now() });
+  await store.setSignal(sessionId, {
+    fbp: fbp || null,
+    fbc: fbc || null,
+    clientIp:  getClientIp(req),
+    userAgent: userAgent || req.headers['user-agent'] || null,
+    pageUrl:   pageUrl   || null,
+    ts:        Date.now(),
+  });
   console.log(`[Signals] ${sessionId.slice(-8)} fbp:${fbp?'v':'x'} fbc:${fbc?'v':'x'}`);
   res.json({ ok: true });
 });
 
+// 2) /link-session — يربط session بـ orderId
 app.post('/link-session', async (req, res) => {
   const { orderId, sessionId } = req.body;
   if (!orderId || !sessionId) return res.status(400).json({ error: 'orderId and sessionId required' });
   const order = await store.getOrder(orderId);
-  if (order) { order.signals = await store.getSignal(sessionId) || {}; await store.setOrder(orderId, order); console.log(`[Link] Late-link → order ${orderId.slice(-8)}`); }
+  if (order) {
+    order.signals = await store.getSignal(sessionId) || {};
+    await store.setOrder(orderId, order);
+    console.log(`[Link] late-link -> order ${orderId.slice(-8)}`);
+  }
   await store.setSignal('link_' + orderId, { sessionId, ts: Date.now() });
-  console.log(`[Link] session → order ${orderId.slice(-8)}`);
+  console.log(`[Link] session -> order ${orderId.slice(-8)}`);
   res.json({ ok: true });
 });
 
+// 3) /webhook/easy-orders — يحفظ بيانات الأوردر مع signals
 app.post('/webhook/easy-orders', async (req, res) => {
-  if (req.headers['secret'] !== CONFIG.EASY_ORDERS_SECRET) { console.warn('[EasyOrders] Secret wrong'); return res.status(401).json({ error: 'Unauthorized' }); }
+  if (req.headers['secret'] !== CONFIG.EASY_ORDERS_SECRET) {
+    console.warn('[EasyOrders] Secret wrong');
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
   res.json({ received: true });
-  const payload = req.body;
-  if (payload.status === 'pending' && payload.id) await handleNewOrder(payload, req);
-  else if (payload.event_type === 'order-status-update') console.log(`[EasyOrders] ${payload.order_id} ${payload.old_status} -> ${payload.new_status}`);
+
+  const p = req.body;
+  if (p.status === 'pending' && p.id) await handleNewOrder(p);
+  else if (p.event_type === 'order-status-update') console.log(`[EasyOrders] ${p.order_id} ${p.old_status} -> ${p.new_status}`);
 });
 
+// 4) /webhook/bosta — مصدر الـ Delivery / Returned events
 app.post('/webhook/bosta', async (req, res) => {
   res.json({ received: true });
+
   const p = req.body;
-  const trackingNumber = String(p.tracking_number || p.trackingNumber || p._id || '');
-  const state = p.state || p.status || p.currentStatus?.state || '';
-  if (!trackingNumber || !state) { console.warn('[Bosta] payload missing'); return; }
-  console.log(`[Bosta] ${trackingNumber} -> ${state}`);
+  const tracking = String(p.tracking_number || p.trackingNumber || p._id || '');
+  const state    = p.state || p.status || p.currentStatus?.state || '';
+  if (!tracking || !state) { console.warn('[Bosta] payload missing'); return; }
 
-  let orderId   = await store.getTracking(trackingNumber);
-  let orderData = orderId ? await store.getOrder(orderId) : null;
+  console.log(`[Bosta] ${tracking} -> ${state}`);
 
-  // Bosta webhook لا يحتوي على رقم الهاتف — نستدعي Bosta API
-  if (!orderData) {
-    const bostaDelivery = await fetchBostaDelivery(trackingNumber);
-    if (bostaDelivery) {
-      const bostaPhone = normalizePhone(bostaDelivery.phone);
-      console.log(`[Bosta API] phone: ${bostaPhone}`);
+  // فقط الحالات النهائية تهمنا
+  if (!isDelivered(state) && !isReturned(state)) return;
 
-      if (bostaPhone) {
-        // محاولة 1: ابحث في Redis
-        const allOrders = await store.getAllOrders();
-        for (const data of allOrders) {
-          if (normalizePhone(data.phone) === bostaPhone) {
-            orderData = data;
-            orderId   = data.orderId;
-            await store.setTracking(trackingNumber, orderId);
-            console.log(`[Bosta] ربط من Redis: ${bostaPhone} -> order ${orderId.slice(-8)}`);
-            break;
-          }
-        }
-
-        // محاولة 2: لو مش موجود في Redis، اسأل Easy Orders API
-        if (!orderData) {
-          console.log(`[Bosta] البحث في Easy Orders بالهاتف: ${bostaPhone}`);
-          orderData = await fetchOrderFromEasyOrders(bostaPhone);
-          if (orderData) {
-            orderId = orderData.orderId;
-            await store.setOrder(orderId, orderData);
-            await store.setTracking(trackingNumber, orderId);
-            console.log(`[Bosta] وجد من Easy Orders: ${orderId.slice(-8)}`);
-          }
-        }
-      }
-    }
-  }
-
-  if (!orderData) {
-    console.warn(`[Bosta] no order for tracking: ${trackingNumber}`);
-    await store.setSignal('bosta_pending_' + trackingNumber, { p, state, ts: Date.now() });
+  // dedup: منعنا re-processing لنفس tracking+state
+  const processedKey = `processed_${tracking}_${state}`;
+  if (await store.getSignal(processedKey)) {
+    console.log(`[Bosta] already processed`);
     return;
   }
-  await handleBostaStatusUpdate(state, orderData);
+
+  await processBostaShipment(tracking, state, processedKey);
 });
 
+// 5) /health
 app.get('/health', async (req, res) => {
-  res.json({ ok: true, storage: getRedis() ? 'redis' : 'memory', orders: await store.orderCount(), tracking: await store.trackingCount(), uptime: Math.floor(process.uptime()) + 's' });
+  res.json({
+    ok: true,
+    storage: getRedis() ? 'redis' : 'memory',
+    orders: await store.orderCount(),
+    tracking: await store.trackingCount(),
+    uptime: Math.floor(process.uptime()) + 's',
+  });
 });
 
-// HANDLERS
-async function handleNewOrder(order, req) {
+// ══════════════════════════════════════════════════════════
+// CORE LOGIC
+// ══════════════════════════════════════════════════════════
+
+async function handleNewOrder(order) {
   console.log(`[New Order] ${order.id.slice(-8)} -- ${order.full_name} -- ${order.total_cost} EGP`);
 
+  // اجلب signals (من link-session أو time-based)
   const linkRecord = await store.getSignal('link_' + order.id);
   const sessionId  = linkRecord?.sessionId || null;
   let signals      = sessionId ? (await store.getSignal(sessionId) || {}) : {};
@@ -240,7 +262,7 @@ async function handleNewOrder(order, req) {
     let latest = null, latestTs = 0;
     const allSigs = await store.getAllSignals();
     for (const { key, val } of allSigs) {
-      if (key.startsWith('link_') || key.startsWith('bosta_')) continue;
+      if (key.startsWith('link_') || key.startsWith('bosta_') || key.startsWith('processed_')) continue;
       if (val.ts && val.ts > cutoff && val.ts > latestTs) { latest = val; latestTs = val.ts; }
     }
     if (latest) { signals = latest; console.log(`[Signals] time-match: ${Math.round((Date.now()-latestTs)/1000)}s ago`); }
@@ -248,39 +270,83 @@ async function handleNewOrder(order, req) {
 
   console.log(`[Signals] fbp:${signals.fbp?'v':'x'} fbc:${signals.fbc?'v':'x'} ip:${signals.clientIp?'v':'x'}`);
 
+  // احفظ الأوردر بكل البيانات التحسينية
   await store.setOrder(order.id, {
-    orderId: order.id, totalCost: order.total_cost, phone: order.phone,
-    email: order.email, fullName: order.full_name, city: order.government,
-    cartItems: order.cart_items || [], createdAt: new Date().toISOString(), signals,
+    orderId:    order.id,
+    totalCost:  order.total_cost,
+    phone:      order.phone,
+    email:      order.email      || null,         // ✓ يحسّن EMQ
+    fullName:   order.full_name  || '',
+    city:       order.government || '',
+    cartItems:  order.cart_items || [],           // ✓ content_ids
+    createdAt:  order.created_at || new Date().toISOString(),
+    signals,                                       // ✓ fbp/fbc/ip/userAgent
   });
-
-  console.log(`[System] waiting for Bosta shipment for order ${order.id.slice(-8)}`);
-
-  const phone = normalizePhone(order.phone);
-  const pending = await store.scanSignals('bosta_pending_');
-  for (const { key, val } of pending) {
-    const pp = normalizePhone(val.p?.receiver?.phone || val.p?.dropOffAddress?.phone || val.p?.phone || '');
-    if (pp && pp === phone) {
-      console.log(`[Bosta] processing pending webhook for order ${order.id.slice(-8)}`);
-      await store.delSignal(key);
-      await handleBostaStatusUpdate(val.state, await store.getOrder(order.id));
-      break;
-    }
-  }
 }
 
-async function handleBostaStatusUpdate(state, orderData) {
-  const { orderId, totalCost, phone, email, fullName, city, cartItems, createdAt, signals = {} } = orderData;
-  const userData = { phone, email, name: fullName, city, fbp: signals.fbp, fbc: signals.fbc, clientIp: signals.clientIp, userAgent: signals.userAgent };
+/**
+ * المنطق الجوهري الجديد:
+ * - نسأل Bosta API للحصول على كل البيانات
+ * - نحاول إيجاد الأوردر في Redis لتحسين البيانات (fbp/fbc/email/content_ids/order_id)
+ * - نبعت Event لـ Meta مهما كان
+ */
+async function processBostaShipment(tracking, state, processedKey) {
+  // اجلب البيانات الكاملة من Bosta API
+  const bosta = await fetchBostaDelivery(tracking);
+  if (!bosta) {
+    console.warn(`[Bosta] couldn't fetch delivery for ${tracking}`);
+    return;
+  }
 
+  console.log(`[Bosta API] phone:${bosta.phone} city:${bosta.city} cod:${bosta.cod}`);
+
+  // طبّق dedup هنا (أنشأناه بعد جلب البيانات لأن الـ Bosta API call قد يفشل)
+  await rSet(`sig:${processedKey}`, { ts: Date.now() }, CONFIG.PROCESSED_TTL);
+
+  // ابحث عن الأوردر في Redis لإضافة بيانات تحسينية
+  let enrichment = null;
+  const normPhone = normalizePhone(bosta.phone);
+
+  // أولاً: عبر tracking number (لو ربطناه قبل)
+  let orderId = await store.getTracking(tracking);
+  if (orderId) enrichment = await store.getOrder(orderId);
+
+  // ثانياً: عبر businessReference (لو Bosta بيرجعها كـ Easy Orders order_id)
+  if (!enrichment && bosta.businessReference) {
+    const byRef = await store.getOrder(bosta.businessReference);
+    if (byRef) {
+      enrichment = byRef;
+      orderId = bosta.businessReference;
+      await store.setTracking(tracking, orderId);
+      console.log(`[Match] by businessReference -> ${orderId.slice(-8)}`);
+    }
+  }
+
+  // ثالثاً: عبر phone (للأوردرات اللي مالهاش tracking مسجل)
+  if (!enrichment && normPhone) {
+    const allOrders = await store.getAllOrders();
+    for (const o of allOrders) {
+      if (normalizePhone(o.phone) === normPhone) {
+        enrichment = o;
+        orderId = o.orderId;
+        await store.setTracking(tracking, orderId);
+        console.log(`[Match] by phone -> ${orderId.slice(-8)}`);
+        break;
+      }
+    }
+  }
+
+  if (enrichment) {
+    console.log(`[Enrich] email:${enrichment.email?'v':'x'} fbp:${enrichment.signals?.fbp?'v':'x'} content_ids:${enrichment.cartItems?.length || 0}`);
+  } else {
+    console.log(`[Enrich] no Redis match -- will send Bosta data only`);
+  }
+
+  // ابعت Event لـ Meta
   if (isDelivered(state)) {
-    console.log(`[Delivered] order ${orderId.slice(-8)} -- ${totalCost} EGP`);
-    await sendMetaEvent('Delivery', { order_id: orderId, value: totalCost, currency: 'EGP', content_ids: cartItems?.map(i => i.product_id)||[], content_type: 'product', payment_method: 'cod', delivery_city: city, delivery_days: calcDeliveryDays(createdAt) }, userData, `delivered_${orderId}`);
-    await updateEasyOrdersStatus(orderId, 'delivered');
+    await sendMetaEvent('Delivery', bosta, enrichment, tracking);
   } else if (isReturned(state)) {
-    console.log(`[Returned] order ${orderId.slice(-8)}`);
-    await sendMetaEvent('OrderReturned', { order_id: orderId, value: totalCost, currency: 'EGP', return_reason: state }, userData, `returned_${orderId}`);
-    await updateEasyOrdersStatus(orderId, 'returned');
+    await sendMetaEvent('OrderReturned', bosta, enrichment, tracking, state);
   }
 }
 
@@ -294,166 +360,131 @@ async function fetchBostaDelivery(trackingNumber) {
     }
     const d = res.body?.data || res.body;
     return {
-      phone: d?.receiver?.phone || d?.receiver?.secondPhone || null,
-      receiver: d?.receiver || null,
+      trackingNumber:    trackingNumber,
+      phone:             d?.receiver?.phone || d?.receiver?.secondPhone || null,
+      firstName:         d?.receiver?.firstName || '',
+      lastName:          d?.receiver?.lastName  || '',
+      fullName:          (d?.receiver?.firstName || '') + ' ' + (d?.receiver?.lastName || ''),
+      city:              d?.dropOffAddress?.city?.name || d?.dropOffAddress?.city || '',
+      zone:              d?.dropOffAddress?.zone?.name || '',
+      cod:               d?.cod ?? null,
       businessReference: d?.businessReference || null,
-      cod: d?.cod || null,
+      creationDate:      d?.creationTimestamp || d?.createdAt || null,
+      updateDate:        d?.updatedAt || null,
     };
   } catch (e) {
-    console.error('[Bosta API] fetchDelivery error:', e.message);
+    console.error('[Bosta API] error:', e.message);
     return null;
   }
 }
 
-async function fetchOrderFromEasyOrders(phone) {
-  try {
-    const url = `${CONFIG.EASY_ORDERS_BASE}/external-apps/orders?store_id=${CONFIG.EASY_ORDERS_STORE_ID}&phone=${encodeURIComponent(phone)}&limit=5&sort=created_at&direction=desc`;
-    console.log(`[EasyOrders DEBUG] URL: ${url}`);
-    const res = await apiCall('GET', url, null, { 'Api-Key': CONFIG.EASY_ORDERS_API_KEY });
-    console.log(`[EasyOrders DEBUG] status: ${res.status}`);
-    console.log(`[EasyOrders DEBUG] body: ${JSON.stringify(res.body).slice(0, 500)}`);
-    if (res.status !== 200) return null;
+async function sendMetaEvent(eventName, bosta, enrichment, tracking, returnReason) {
+  // ─── User Data: Bosta + enrichment ───
+  const phone     = bosta.phone || enrichment?.phone;
+  const firstName = bosta.firstName || enrichment?.fullName?.split(' ')[0]              || '';
+  const lastName  = bosta.lastName  || enrichment?.fullName?.split(' ').slice(1).join(' ') || '';
+  const city      = bosta.city      || enrichment?.city;
+  const email     = enrichment?.email; // Email من Easy Orders فقط
+  const fbp       = enrichment?.signals?.fbp;
+  const fbc       = enrichment?.signals?.fbc;
+  const clientIp  = enrichment?.signals?.clientIp;
+  const userAgent = enrichment?.signals?.userAgent;
 
-    // الـ API قد يرجع البيانات في data أو orders أو نفس الـ root
-    const orders = res.body?.data || res.body?.orders || res.body?.results || (Array.isArray(res.body) ? res.body : null);
-    if (!orders || !orders.length) {
-      console.warn('[EasyOrders DEBUG] لا توجد أوردرات بهذا الرقم');
-      return null;
-    }
-    console.log(`[EasyOrders DEBUG] عدد الأوردرات: ${orders.length}`);
+  // ─── Custom Data: Bosta + enrichment ───
+  const value       = bosta.cod || enrichment?.totalCost;
+  const contentIds  = enrichment?.cartItems?.map(i => i.product_id) || [];
+  const orderId     = enrichment?.orderId || bosta.businessReference || tracking;
+  const deliveryDays = enrichment?.createdAt
+    ? Math.round((Date.now() - new Date(enrichment.createdAt).getTime()) / 86400000)
+    : null;
 
-    const order = orders[0];
-    return {
-      orderId:   order.id,
-      totalCost: order.total_cost,
-      phone:     order.phone,
-      email:     order.email     || null,
-      fullName:  order.full_name || '',
-      city:      order.government || '',
-      cartItems: order.cart_items || [],
-      createdAt: order.created_at || new Date().toISOString(),
-      signals:   {},
-    };
-  } catch (e) {
-    console.error('[EasyOrders] fetchOrder error:', e.message);
-    return null;
-  }
-}
+  // ─── Event ID للـ deduplication ───
+  // نستخدم order_id لو متوفر، وإلا tracking
+  const eventId = `${eventName.toLowerCase()}_${orderId}`;
 
-async function updateEasyOrdersStatus(orderId, status) {
-  try { await apiCall('PATCH', `${CONFIG.EASY_ORDERS_BASE}/external-apps/orders/${orderId}`, { status }, { 'Api-Key': CONFIG.EASY_ORDERS_API_KEY }); }
-  catch (e) { console.error('[EasyOrders] Update error:', e.message); }
-}
+  const payload = {
+    data: [{
+      event_name:    eventName,
+      event_time:    Math.floor(Date.now() / 1000),
+      action_source: 'website',
+      event_id:      eventId,
+      user_data: {
+        em:                email     ? [sha256(email)]                     : undefined,
+        ph:                phone     ? [sha256(phoneForMeta(phone))]       : undefined,
+        fn:                firstName ? [sha256(firstName)]                 : undefined,
+        ln:                lastName  ? [sha256(lastName)]                  : undefined,
+        ct:                city      ? [sha256(city.toLowerCase())]        : undefined,
+        country:           [sha256('eg')],
+        external_id:       orderId   ? [sha256(orderId)]                   : undefined,  // ✓ extra EMQ
+        fbp:               fbp       || undefined,
+        fbc:               fbc       || undefined,
+        client_ip_address: clientIp  || undefined,
+        client_user_agent: userAgent || undefined,
+      },
+      custom_data: {
+        order_id:       orderId,
+        currency:       'EGP',
+        value:          value,
+        content_ids:    contentIds,
+        content_type:   contentIds.length ? 'product' : undefined,
+        tracking_number: tracking,
+        payment_method: 'cod',
+        delivery_city:  city,
+        delivery_days:  deliveryDays,
+        ...(returnReason ? { return_reason: String(returnReason) } : {}),
+      },
+    }],
+  };
 
-async function sendMetaEvent(eventName, customData, userData, eventId) {
-  const payload = { data: [{ event_name: eventName, event_time: Math.floor(Date.now()/1000), action_source: 'website', event_id: eventId,
-    user_data: {
-      em: userData.email ? [sha256(userData.email)] : undefined,
-      ph: userData.phone ? [sha256(phoneForMeta(userData.phone))] : undefined,
-      fn: userData.name  ? [sha256(userData.name.split(' ')[0])] : undefined,
-      ln: userData.name  ? [sha256(userData.name.split(' ').slice(1).join(' '))] : undefined,
-      ct: userData.city  ? [sha256(userData.city.toLowerCase())] : undefined,
-      country: [sha256('eg')],
-      fbp: userData.fbp || undefined,
-      fbc: userData.fbc || undefined,
-      client_ip_address: userData.clientIp  || undefined,
-      client_user_agent: userData.userAgent || undefined,
-    }, custom_data: customData,
-  }]};
   try {
     const url = `${CONFIG.META_CAPI_BASE}/${CONFIG.META_PIXEL_ID}/events?access_token=${CONFIG.META_CAPI_TOKEN}`;
     const res = await apiCall('POST', url, JSON.parse(JSON.stringify(payload)));
-    console.log(`[Meta] ${eventName} -> ${res.status} events_received:${res.body?.events_received ?? '?'}`);
-  } catch (e) { console.error(`[Meta] ${eventName} error:`, e.message); }
+    console.log(`[Meta] ${eventName} -> ${res.status} events_received:${res.body?.events_received ?? '?'} event_id:${eventId}`);
+    if (res.status !== 200) {
+      console.warn(`[Meta] response body:`, JSON.stringify(res.body).slice(0, 300));
+    }
+  } catch (e) {
+    console.error(`[Meta] ${eventName} error:`, e.message);
+  }
 }
 
-// ══════════════════════════════════════════════════════════
-// BOSTA POLLING — Safety net عبر POST /deliveries/search
-// ══════════════════════════════════════════════════════════
-const POLL_INTERVAL_MS  = 60 * 60 * 1000;     // كل ساعة
-const POLL_PAGE_LIMIT   = 50;                 // 50 شحنة لكل صفحة
-const POLL_MAX_PAGES    = 10;                 // حد أقصى 500 شحنة في الدورة
-const PROCESSED_TTL     = 30 * 24 * 60 * 60;  // علامة المعالجة تبقى 30 يوم
+// ──────────────────────────────────────────────────────────
+// Polling: كل ساعة، فحص آخر الشحنات من Bosta
+// ──────────────────────────────────────────────────────────
+const POLL_INTERVAL_MS = 60 * 60 * 1000;
+const POLL_PAGE_LIMIT  = 50;
+const POLL_MAX_PAGES   = 10;
 let pollRunning = false;
 
 async function pollBostaDeliveries() {
-  if (pollRunning) {
-    console.log('[Poll] دورة سابقة لسه شغّالة - تجاوز');
-    return;
-  }
+  if (pollRunning) { console.log('[Poll] dropped - previous cycle running'); return; }
   pollRunning = true;
-
   console.log('[Poll] ===== Starting Bosta poll =====');
-  let totalScanned   = 0;
-  let totalNewEvents = 0;
-  let totalMatched   = 0;
+  let totalScanned = 0, totalSent = 0;
 
   try {
     for (let page = 0; page < POLL_MAX_PAGES; page++) {
       const url = `${CONFIG.BOSTA_BASE}/deliveries/search`;
       const body = { pageNumber: page, pageLimit: POLL_PAGE_LIMIT };
       const res = await apiCall('POST', url, body, { 'Authorization': CONFIG.BOSTA_API_KEY });
-
-      if (res.status !== 200) {
-        console.warn(`[Poll] page ${page} returned ${res.status}`);
-        break;
-      }
+      if (res.status !== 200) { console.warn(`[Poll] page ${page} -> ${res.status}`); break; }
 
       const deliveries = res.body?.data?.deliveries || [];
-      if (!deliveries.length) {
-        console.log(`[Poll] No more deliveries at page ${page}`);
-        break;
-      }
-
+      if (!deliveries.length) break;
       console.log(`[Poll] Page ${page}: ${deliveries.length} deliveries`);
-
-      // اجلب كل الأوردرات مرة واحدة (تحسين أداء)
-      const allOrders = await store.getAllOrders();
 
       for (const d of deliveries) {
         totalScanned++;
         const tracking = d.trackingNumber || d._id;
         const state    = d.state?.code ?? d.state?.value ?? d.state ?? 0;
-        const phone    = d.receiver?.phone || d.receiver?.secondPhone;
 
-        // نهتم فقط بالحالات النهائية
         if (!isDelivered(state) && !isReturned(state)) continue;
 
-        // علامة المعالجة - تجنب re-process
         const processedKey = `processed_${tracking}_${state}`;
-        const already = await store.getSignal(processedKey);
-        if (already) continue;
+        if (await store.getSignal(processedKey)) continue;
 
-        const normPhone = normalizePhone(phone);
-        if (!normPhone) continue;
-
-        // ابحث في Redis
-        let orderData = null;
-        for (const o of allOrders) {
-          if (normalizePhone(o.phone) === normPhone) { orderData = o; break; }
-        }
-
-        // fallback لـ Easy Orders
-        if (!orderData) {
-          orderData = await fetchOrderFromEasyOrders(normPhone);
-          if (orderData) {
-            await store.setOrder(orderData.orderId, orderData);
-            allOrders.push(orderData);
-          }
-        }
-
-        if (!orderData) {
-          console.warn(`[Poll] لا أوردر للهاتف: ${normPhone} (tracking: ${tracking})`);
-          continue;
-        }
-
-        // علّم وأرسل
-        await store.setTracking(tracking, orderData.orderId);
-        await handleBostaStatusUpdate(state, orderData);
-        await rSet(`sig:${processedKey}`, { ts: Date.now() }, PROCESSED_TTL);
-        totalMatched++;
-        totalNewEvents++;
-        console.log(`[Poll] ✓ ${tracking} state ${state} -> order ${orderData.orderId.slice(-8)}`);
+        await processBostaShipment(tracking, state, processedKey);
+        totalSent++;
       }
     }
   } catch (e) {
@@ -462,24 +493,23 @@ async function pollBostaDeliveries() {
     pollRunning = false;
   }
 
-  console.log(`[Poll] ===== Done: scanned ${totalScanned}, matched ${totalMatched}, new events ${totalNewEvents} =====`);
+  console.log(`[Poll] ===== Done: scanned ${totalScanned}, sent ${totalSent} =====`);
 }
 
-// شغّل Polling تلقائياً كل ساعة
 setInterval(pollBostaDeliveries, POLL_INTERVAL_MS);
-// أول دورة بعد دقيقتين من بدء السيرفر (وقت لتحميل Redis)
 setTimeout(pollBostaDeliveries, 2 * 60 * 1000);
 
-// Endpoint يدوي لتشغيل Polling فوراً
-app.post('/admin/poll', async (req, res) => {
+app.post('/admin/poll', (req, res) => {
   res.json({ started: true, alreadyRunning: pollRunning });
   pollBostaDeliveries();
 });
 
+// ──────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`\nCOD Meta Tracking v4.0 -- Port ${PORT}`);
+  console.log(`\nCOD Meta Tracking v5.0 -- Port ${PORT}`);
   console.log(`Storage: ${getRedis() ? 'Redis' : 'Memory'}`);
+  console.log(`Bosta = source of truth, Redis = enrichment\n`);
 });
 
 module.exports = app;
