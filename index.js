@@ -320,14 +320,17 @@ async function handleNewOrder(order, fromStore) {
   });
 }
 
-async function processBostaShipment(tracking, stateRaw, processedKey) {
-  const bosta = await fetchBostaDelivery(tracking);
+async function processBostaShipment(tracking, stateRaw, processedKey, prefetchedData) {
+  // لو البيانات متوفرة من الـ list response، استخدمها بدل ما نعمل API call إضافي
+  const bosta = prefetchedData || await fetchBostaDelivery(tracking);
   if (!bosta) {
     console.warn(`[Bosta] couldn't fetch delivery for ${tracking}`);
     return;
   }
 
-  console.log(`[Bosta API] phone:${bosta.phone} city:${bosta.city} cod:${bosta.cod}`);
+  if (!prefetchedData) {
+    console.log(`[Bosta API] phone:${bosta.phone} city:${bosta.city} cod:${bosta.cod}`);
+  }
   await rSet(`sig:${processedKey}`, { ts: Date.now() }, CONFIG.PROCESSED_TTL);
 
   let enrichment = null;
@@ -387,23 +390,28 @@ async function fetchBostaDelivery(trackingNumber) {
       console.warn(`[Bosta API] ${trackingNumber} -> ${res.status}`);
       return null;
     }
-    const d = res.body?.data || res.body;
-    return {
-      trackingNumber:    trackingNumber,
-      phone:             d?.receiver?.phone || d?.receiver?.secondPhone || null,
-      firstName:         d?.receiver?.firstName || '',
-      lastName:          d?.receiver?.lastName  || '',
-      fullName:          (d?.receiver?.firstName || '') + ' ' + (d?.receiver?.lastName || ''),
-      city:              d?.dropOffAddress?.city?.name || d?.dropOffAddress?.city || '',
-      zone:              d?.dropOffAddress?.zone?.name || '',
-      cod:               d?.cod ?? null,
-      businessReference: d?.businessReference || null,
-      creationDate:      d?.creationTimestamp || d?.createdAt || null,
-    };
+    return extractBostaData(res.body?.data || res.body, trackingNumber);
   } catch (e) {
     console.error('[Bosta API] error:', e.message);
     return null;
   }
+}
+
+// استخراج بيانات Bosta من response (يعمل لكلا من list response و single response)
+function extractBostaData(d, trackingNumber) {
+  if (!d) return null;
+  return {
+    trackingNumber:    trackingNumber || d.trackingNumber || d._id,
+    phone:             d?.receiver?.phone || d?.receiver?.secondPhone || null,
+    firstName:         d?.receiver?.firstName || '',
+    lastName:          d?.receiver?.lastName  || '',
+    fullName:          (d?.receiver?.firstName || '') + ' ' + (d?.receiver?.lastName || ''),
+    city:              d?.dropOffAddress?.city?.name || d?.dropOffAddress?.city || '',
+    zone:              d?.dropOffAddress?.zone?.name || '',
+    cod:               d?.cod ?? null,
+    businessReference: d?.businessReference || null,
+    creationDate:      d?.creationTimestamp || d?.createdAt || null,
+  };
 }
 
 async function sendMetaEvent(eventName, bosta, enrichment, tracking, returnReason, targetStore) {
@@ -487,7 +495,7 @@ async function sendMetaEvent(eventName, bosta, enrichment, tracking, returnReaso
 // ══════════════════════════════════════════════════════════
 const POLL_INTERVAL_MS    = 60 * 60 * 1000;          // كل ساعة
 const POLL_PAGE_LIMIT     = 200;                     // 200 شحنة/صفحة (sweet spot)
-const POLL_MAX_PAGES      = 3;                       // 3 صفحات = 600 شحنة كل دورة
+const POLL_MAX_PAGES      = 5;                       // 5 صفحات = 1000 شحنة كل دورة
 let pollRunning = false;
 
 async function pollBostaDeliveries() {
@@ -526,7 +534,9 @@ async function pollBostaDeliveries() {
         const processedKey = `processed_${tracking}_${state}`;
         if (await store.getSignal(processedKey)) continue;
 
-        await processBostaShipment(tracking, state, processedKey);
+        // ✓ Optimization: نمرر بيانات Bosta من الـ list response مباشرة - بدون API call إضافي
+        const bostaData = extractBostaData(d, tracking);
+        await processBostaShipment(tracking, state, processedKey, bostaData);
         totalSent++;
       }
     }
@@ -549,7 +559,7 @@ setTimeout(pollBostaDeliveries, 2 * 60 * 1000);
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`\n╔════════════════════════════════════════════╗`);
-  console.log(`║   COD Meta Tracking v7.0 — Full Pagination║`);
+  console.log(`║   COD Meta Tracking v7.1 — Optimized      ║`);
   console.log(`╠════════════════════════════════════════════╣`);
   console.log(`║  Port    : ${String(PORT).padEnd(32)}║`);
   console.log(`║  Storage : ${(getRedis() ? 'Redis ✓' : 'Memory ⚠').padEnd(32)}║`);
