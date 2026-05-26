@@ -614,6 +614,127 @@ setTimeout(pollBostaDeliveries, 2 * 60 * 1000);
 
 // ══════════════════════════════════════════════════════════
 // START
+/**
+ * test-bosta-deep-discovery.js
+ * ==============================
+ * اختبار شامل لكل التراكيب الممكنة بناءً على اقتراح Gemini:
+ *
+ * - 2 subdomains: app.bosta.co + api.bosta.co
+ * - 3 versions: v0, v1, v2
+ * - Endpoints: /deliveries, /deliveries/list, /business/deliveries
+ * - Methods: GET (query) + POST (body)
+ * - Verify pagination بمقارنة page 0 vs page 1
+ *
+ * Usage: /admin/test-deep-discovery
+ */
+
+app.get('/admin/test-deep-discovery', async (req, res) => {
+  const headers = { 'Authorization': CONFIG.BOSTA_API_KEY };
+  const subdomains = ['app.bosta.co', 'api.bosta.co'];
+  const versions   = ['v0', 'v1', 'v2'];
+  const paths      = ['/deliveries', '/deliveries/list', '/business/deliveries'];
+
+  const results   = [];
+  const working   = [];
+
+  console.log(`\n===== [DEEP DISCOVERY] =====`);
+
+  for (const sub of subdomains) {
+    for (const v of versions) {
+      for (const path of paths) {
+        const base = `https://${sub}/api/${v}${path}`;
+
+        // GET بـ query params
+        const getUrls = [
+          `${base}?pageNumber=0&limit=10`,
+          `${base}?pageNumber=0&pageLimit=10`,
+          `${base}?page=0&limit=10`,
+          `${base}?offset=0&limit=10`,
+        ];
+
+        for (const url of getUrls) {
+          try {
+            const r = await apiCall('GET', url, null, headers);
+            const status = r.status;
+            const isHTML = typeof r.body === 'string' && r.body.includes('<!DOCTYPE');
+            const isError = status >= 400;
+
+            if (!isError && !isHTML) {
+              const deliveries = r.body?.data?.deliveries || r.body?.deliveries || r.body?.data || (Array.isArray(r.body) ? r.body : null);
+              if (Array.isArray(deliveries) && deliveries.length) {
+                const firstId = deliveries[0]?._id || deliveries[0]?.trackingNumber;
+                console.log(`[DISCOVERY] ✓ GET ${url} → ${status} count:${deliveries.length} first:${firstId}`);
+                working.push({ method: 'GET', url, status, count: deliveries.length, firstId });
+
+                // اختبر pagination
+                const page1Url = url.replace('pageNumber=0', 'pageNumber=1')
+                                    .replace('page=0', 'page=1')
+                                    .replace('offset=0', 'offset=10');
+                if (page1Url !== url) {
+                  const r2 = await apiCall('GET', page1Url, null, headers);
+                  const d2 = r2.body?.data?.deliveries || r2.body?.deliveries || r2.body?.data || [];
+                  const firstId2 = d2[0]?._id || d2[0]?.trackingNumber;
+                  const paginationWorks = firstId && firstId2 && firstId !== firstId2;
+                  console.log(`[DISCOVERY]   page1: first:${firstId2} pagination:${paginationWorks ? '✓ WORKS' : '✗ SAME'}`);
+                  working[working.length - 1].paginationWorks = paginationWorks;
+                  working[working.length - 1].page1FirstId = firstId2;
+                }
+              } else {
+                results.push({ method: 'GET', url, status, note: 'no deliveries array' });
+              }
+            } else {
+              results.push({ method: 'GET', url, status, note: isHTML ? 'HTML error' : 'error' });
+            }
+          } catch (e) {
+            results.push({ method: 'GET', url, error: e.message });
+          }
+        }
+
+        // POST بـ body
+        try {
+          const r = await apiCall('POST', base, { pageNumber: 0, limit: 10, pageLimit: 10 }, headers);
+          const isHTML = typeof r.body === 'string' && r.body.includes('<!DOCTYPE');
+          if (r.status < 400 && !isHTML) {
+            const deliveries = r.body?.data?.deliveries || r.body?.deliveries || r.body?.data || [];
+            if (Array.isArray(deliveries) && deliveries.length) {
+              const firstId = deliveries[0]?._id || deliveries[0]?.trackingNumber;
+              console.log(`[DISCOVERY] ✓ POST ${base} → ${r.status} count:${deliveries.length} first:${firstId}`);
+              working.push({ method: 'POST', url: base, status: r.status, count: deliveries.length, firstId });
+
+              // pagination test
+              const r2 = await apiCall('POST', base, { pageNumber: 1, limit: 10, pageLimit: 10 }, headers);
+              const d2 = r2.body?.data?.deliveries || r2.body?.deliveries || r2.body?.data || [];
+              const firstId2 = d2[0]?._id || d2[0]?.trackingNumber;
+              const paginationWorks = firstId && firstId2 && firstId !== firstId2;
+              console.log(`[DISCOVERY]   POST page1: first:${firstId2} pagination:${paginationWorks ? '✓ WORKS' : '✗ SAME'}`);
+              working[working.length - 1].paginationWorks = paginationWorks;
+            }
+          }
+        } catch (e) {}
+      }
+    }
+  }
+
+  console.log(`\n===== VERDICT =====`);
+  console.log(`Working endpoints: ${working.length}`);
+  const withPagination = working.filter(w => w.paginationWorks);
+  console.log(`Endpoints with WORKING pagination: ${withPagination.length}`);
+  for (const w of withPagination) {
+    console.log(`  🎯 ${w.method} ${w.url}`);
+  }
+  console.log(`===================\n`);
+
+  res.json({
+    summary: {
+      totalWorking:    working.length,
+      withPagination:  withPagination.length,
+    },
+    workingEndpoints:      working,
+    paginationEndpoints:   withPagination,
+    failedCount:           results.length,
+  });
+});
+
 // ══════════════════════════════════════════════════════════
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
