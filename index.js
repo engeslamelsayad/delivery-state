@@ -1,12 +1,18 @@
 /**
- * index.js — COD Meta Tracking System v5.0
- * ============================================
- * فلسفة جديدة: Bosta = مصدر التسليم، Redis = طبقة التحسين
+ * index.js — COD Meta Tracking System v6.0 — Multi-Store
+ * =========================================================
+ * يدعم متاجر متعددة على نفس السيرفر:
+ *   - كل متجر له Easy Orders Secret خاص (يحدد المتجر)
+ *   - كل متجر له Meta Pixel + CAPI Token خاص (يحدد لمن نبعت)
+ *   - Bosta API + Redis مشتركة بين كل المتاجر
  *
- * - كل شحنة في Bosta تبعت Event لـ Meta (سواء عرفنا الأوردر أم لا)
- * - Easy Orders Webhook يحفظ بيانات إضافية (email, fbp, fbc, content_ids) في Redis
- * - لما تتسلّم الشحنة: نأخذ phone/name/city/value من Bosta + email/fbp/fbc من Redis
- * - نتيجة: تغطية 100% + EMQ عالي لما نملك بيانات إضافية
+ * Environment Variables Format:
+ *   STORE_1_NAME, STORE_1_DOMAINS, STORE_1_EASY_ORDERS_SECRET,
+ *   STORE_1_META_PIXEL_ID, STORE_1_META_CAPI_TOKEN
+ *   (نفس النمط لـ STORE_2_*, STORE_3_*, ...)
+ *
+ * Backward compatible: لو ENV vars القديمة موجودة (META_PIXEL_ID, EASY_ORDERS_SECRET)
+ * بدون STORE_1_*, ستعمل كمتجر واحد افتراضي.
  */
 
 const express = require('express');
@@ -15,46 +21,80 @@ const https   = require('https');
 const path    = require('path');
 const Redis   = require('ioredis');
 
+// ══════════════════════════════════════════════════════════
+// MULTI-STORE CONFIG
+// ══════════════════════════════════════════════════════════
+function loadStores() {
+  const list = [];
+  for (let i = 1; i <= 20; i++) {
+    const name = process.env[`STORE_${i}_NAME`];
+    if (!name) break;
+    list.push({
+      index:     i - 1,
+      name:      name,
+      secret:    process.env[`STORE_${i}_EASY_ORDERS_SECRET`] || '',
+      pixelId:   process.env[`STORE_${i}_META_PIXEL_ID`]      || '',
+      capiToken: process.env[`STORE_${i}_META_CAPI_TOKEN`]    || '',
+      domains:   (process.env[`STORE_${i}_DOMAINS`] || '')
+                  .split(',').map(s => s.trim()).filter(Boolean),
+    });
+  }
+  // Backward compat: متجر افتراضي من env vars القديمة
+  if (list.length === 0 && process.env.META_PIXEL_ID) {
+    list.push({
+      index:     0,
+      name:      'default',
+      secret:    process.env.EASY_ORDERS_SECRET || '',
+      pixelId:   process.env.META_PIXEL_ID      || '',
+      capiToken: process.env.META_CAPI_TOKEN    || '',
+      domains:   (process.env.ALLOWED_ORIGINS || '')
+                  .split(',').map(s => s.trim()).filter(Boolean),
+    });
+  }
+  return list;
+}
+
+const STORES           = loadStores();
+const SECRET_TO_STORE  = Object.fromEntries(STORES.filter(s => s.secret).map(s => [s.secret, s]));
+const ALLOWED_ORIGINS  = new Set(STORES.flatMap(s => s.domains));
+const DEFAULT_STORE    = STORES[0];
+
+const CONFIG = {
+  BOSTA_API_KEY:  process.env.BOSTA_API_KEY  || '',
+  BOSTA_BASE:     'https://app.bosta.co/api/v2',
+  META_CAPI_BASE: 'https://graph.facebook.com/v19.0',
+  REDIS_URL:      process.env.REDIS_URL      || '',
+  SIGNAL_TTL:     4  * 60 * 60,
+  ORDER_TTL:      30 * 24 * 60 * 60,
+  TRACKING_TTL:   30 * 24 * 60 * 60,
+  PROCESSED_TTL:  30 * 24 * 60 * 60,
+};
+
+// ══════════════════════════════════════════════════════════
+// APP + MIDDLEWARE
+// ══════════════════════════════════════════════════════════
 const app = express();
 app.use(express.json());
 
 app.get('/header-script.js', (req, res) => {
-  res.setHeader('Content-Type', 'application/javascript');
+  res.setHeader('Content-Type',  'application/javascript');
   res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
   res.sendFile(path.join(__dirname, 'header-script.js'));
 });
 
-const ALLOWED_ORIGINS = [
-  'https://www.cosmoeg.shop','https://cosmoeg.shop',
-  'https://www.eecm.shop','https://eecm.shop',
-];
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-  if (ALLOWED_ORIGINS.includes(origin)) res.setHeader('Access-Control-Allow-Origin', origin);
-  res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (ALLOWED_ORIGINS.has(origin)) res.setHeader('Access-Control-Allow-Origin', origin);
+  res.setHeader('Access-Control-Allow-Methods',     'POST, GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers',     'Content-Type');
   res.setHeader('Access-Control-Allow-Credentials', 'true');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
 
-const CONFIG = {
-  EASY_ORDERS_SECRET:   process.env.EASY_ORDERS_SECRET   || '',
-  BOSTA_API_KEY:        process.env.BOSTA_API_KEY        || '',
-  BOSTA_BASE:           'https://app.bosta.co/api/v2',
-  META_PIXEL_ID:        process.env.META_PIXEL_ID        || '',
-  META_CAPI_TOKEN:      process.env.META_CAPI_TOKEN      || '',
-  META_CAPI_BASE:       'https://graph.facebook.com/v19.0',
-  REDIS_URL:            process.env.REDIS_URL            || '',
-  SIGNAL_TTL:    4  * 60 * 60,        // 4 ساعات
-  ORDER_TTL:     30 * 24 * 60 * 60,   // 30 يوم (أطول لأن دورة التسليم قد تطول)
-  TRACKING_TTL:  30 * 24 * 60 * 60,
-  PROCESSED_TTL: 30 * 24 * 60 * 60,
-};
-
-// ──────────────────────────────────────────────────────────
-// Redis
-// ──────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════
+// REDIS
+// ══════════════════════════════════════════════════════════
 let redis = null;
 function getRedis() {
   if (!redis && CONFIG.REDIS_URL) {
@@ -77,21 +117,20 @@ async function rKeys(pattern) {
   try { return await getRedis()?.keys(pattern) || []; } catch(e) { return []; }
 }
 
-// Memory fallback
 const mem = { signals: new Map(), orders: new Map(), tracking: new Map() };
 setInterval(() => {
   const cutoff = Date.now() - CONFIG.SIGNAL_TTL * 1000;
-  for (const [k,v] of mem.signals) if (v.ts && v.ts < cutoff) mem.signals.delete(k);
+  for (const [k, v] of mem.signals) if (v.ts && v.ts < cutoff) mem.signals.delete(k);
 }, 30 * 60 * 1000);
 
 const store = {
-  async setSignal(k, v)    { getRedis() ? await rSet(`sig:${k}`, v, CONFIG.SIGNAL_TTL)    : mem.signals.set(k, v); },
-  async getSignal(k)       { return getRedis() ? await rGet(`sig:${k}`)                   : (mem.signals.get(k) || null); },
-  async delSignal(k)       { getRedis() ? await rDel(`sig:${k}`)                          : mem.signals.delete(k); },
-  async setOrder(id, v)    { getRedis() ? await rSet(`order:${id}`, v, CONFIG.ORDER_TTL)   : mem.orders.set(id, v); },
-  async getOrder(id)       { return getRedis() ? await rGet(`order:${id}`)                : (mem.orders.get(id) || null); },
-  async setTracking(k, v)  { getRedis() ? await rSet(`track:${k}`, v, CONFIG.TRACKING_TTL): mem.tracking.set(k, v); },
-  async getTracking(k)     { return getRedis() ? await rGet(`track:${k}`)                 : (mem.tracking.get(k) || null); },
+  async setSignal(k, v)   { getRedis() ? await rSet(`sig:${k}`,    v, CONFIG.SIGNAL_TTL)    : mem.signals.set(k, v); },
+  async getSignal(k)      { return getRedis() ? await rGet(`sig:${k}`)    : (mem.signals.get(k)  || null); },
+  async delSignal(k)      { getRedis() ? await rDel(`sig:${k}`)           : mem.signals.delete(k); },
+  async setOrder(id, v)   { getRedis() ? await rSet(`order:${id}`, v, CONFIG.ORDER_TTL)    : mem.orders.set(id, v); },
+  async getOrder(id)      { return getRedis() ? await rGet(`order:${id}`) : (mem.orders.get(id) || null); },
+  async setTracking(k, v) { getRedis() ? await rSet(`track:${k}`,  v, CONFIG.TRACKING_TTL) : mem.tracking.set(k, v); },
+  async getTracking(k)    { return getRedis() ? await rGet(`track:${k}`)  : (mem.tracking.get(k) || null); },
 
   async getAllOrders() {
     if (getRedis()) {
@@ -111,16 +150,15 @@ const store = {
     }
     return Array.from(mem.signals.entries()).map(([key, val]) => ({ key, val }));
   },
-  async orderCount()   { return getRedis() ? (await rKeys('order:*')).length   : mem.orders.size; },
-  async trackingCount(){ return getRedis() ? (await rKeys('track:*')).length   : mem.tracking.size; },
+  async orderCount()    { return getRedis() ? (await rKeys('order:*')).length : mem.orders.size; },
+  async trackingCount() { return getRedis() ? (await rKeys('track:*')).length : mem.tracking.size; },
 };
 
-// ──────────────────────────────────────────────────────────
-// Helpers
-// ──────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════
+// HELPERS
+// ══════════════════════════════════════════════════════════
 const sha256 = v => v ? crypto.createHash('sha256').update(String(v).toLowerCase().trim()).digest('hex') : undefined;
 
-// طبّع لرقم محلي 01xxx للمقارنة
 const normalizePhone = p => {
   if (!p) return p;
   let d = p.replace(/\D/g, '');
@@ -129,7 +167,6 @@ const normalizePhone = p => {
   return d;
 };
 
-// E.164 لـ Meta (201xxxxxxxxx بدون +)
 const phoneForMeta = p => {
   const n = normalizePhone(p);
   if (!n) return n;
@@ -141,8 +178,7 @@ const isReturned  = s => [46, '46', 48, '48', 49, '49', 100, '100', 101, '101', 
 
 const getClientIp = req =>
   req.headers['x-forwarded-for']?.split(',')[0]?.trim() ||
-  req.headers['x-real-ip'] ||
-  req.socket?.remoteAddress || null;
+  req.headers['x-real-ip'] || req.socket?.remoteAddress || null;
 
 function apiCall(method, url, body, headers = {}) {
   return new Promise((resolve, reject) => {
@@ -166,23 +202,19 @@ function apiCall(method, url, body, headers = {}) {
 // ENDPOINTS
 // ══════════════════════════════════════════════════════════
 
-// 1) /collect-signals — يستقبل fbp/fbc من المتصفح
 app.post('/collect-signals', async (req, res) => {
   const { sessionId, fbp, fbc, userAgent, pageUrl } = req.body;
   if (!sessionId) return res.status(400).json({ error: 'sessionId required' });
   await store.setSignal(sessionId, {
-    fbp: fbp || null,
-    fbc: fbc || null,
-    clientIp:  getClientIp(req),
+    fbp: fbp || null, fbc: fbc || null,
+    clientIp: getClientIp(req),
     userAgent: userAgent || req.headers['user-agent'] || null,
-    pageUrl:   pageUrl   || null,
-    ts:        Date.now(),
+    pageUrl: pageUrl || null, ts: Date.now(),
   });
   console.log(`[Signals] ${sessionId.slice(-8)} fbp:${fbp?'v':'x'} fbc:${fbc?'v':'x'}`);
   res.json({ ok: true });
 });
 
-// 2) /link-session — يربط session بـ orderId
 app.post('/link-session', async (req, res) => {
   const { orderId, sessionId } = req.body;
   if (!orderId || !sessionId) return res.status(400).json({ error: 'orderId and sessionId required' });
@@ -197,62 +229,74 @@ app.post('/link-session', async (req, res) => {
   res.json({ ok: true });
 });
 
-// 3) /webhook/easy-orders — يحفظ بيانات الأوردر مع signals
+// Easy Orders Webhook — يحدد المتجر من الـ secret
 app.post('/webhook/easy-orders', async (req, res) => {
-  if (req.headers['secret'] !== CONFIG.EASY_ORDERS_SECRET) {
-    console.warn('[EasyOrders] Secret wrong');
+  const secret = req.headers['secret'];
+  const fromStore = SECRET_TO_STORE[secret];
+
+  if (!fromStore) {
+    console.warn(`[EasyOrders] Unknown secret (got: "${secret?.slice(0, 8)}...")`);
     return res.status(401).json({ error: 'Unauthorized' });
   }
-  res.json({ received: true });
+
+  res.json({ received: true, store: fromStore.name });
 
   const p = req.body;
-  if (p.status === 'pending' && p.id) await handleNewOrder(p);
-  else if (p.event_type === 'order-status-update') console.log(`[EasyOrders] ${p.order_id} ${p.old_status} -> ${p.new_status}`);
+  if (p.status === 'pending' && p.id) await handleNewOrder(p, fromStore);
+  else if (p.event_type === 'order-status-update') console.log(`[EasyOrders/${fromStore.name}] ${p.order_id} ${p.old_status} -> ${p.new_status}`);
 });
 
-// 4) /webhook/bosta — مصدر الـ Delivery / Returned events
+// Bosta Webhook — مشترك بين كل المتاجر
 app.post('/webhook/bosta', async (req, res) => {
   res.json({ received: true });
-
   const p = req.body;
   const tracking = String(p.tracking_number || p.trackingNumber || p._id || '');
-  const state    = p.state || p.status || p.currentStatus?.state || '';
-  if (!tracking || !state) { console.warn('[Bosta] payload missing'); return; }
+  const stateRaw = p.state || p.status || p.currentStatus?.state || '';
+  if (!tracking || !stateRaw) { console.warn('[Bosta] payload missing'); return; }
 
-  console.log(`[Bosta] ${tracking} -> ${state}`);
+  console.log(`[Bosta] ${tracking} -> ${stateRaw}`);
 
-  // فقط الحالات النهائية تهمنا
-  if (!isDelivered(state) && !isReturned(state)) return;
+  // سجّل الـ tracking للمتابعة المستقبلية (مهما كانت الحالة)
+  await addToTracked(tracking, null);
 
-  // dedup: منعنا re-processing لنفس tracking+state
-  const processedKey = `processed_${tracking}_${state}`;
+  if (!isDelivered(stateRaw) && !isReturned(stateRaw)) return;
+
+  const processedKey = `processed_${tracking}_${stateRaw}`;
   if (await store.getSignal(processedKey)) {
     console.log(`[Bosta] already processed`);
+    await removeFromTracked(tracking);
     return;
   }
 
-  await processBostaShipment(tracking, state, processedKey);
+  await processBostaShipment(tracking, stateRaw, processedKey);
+  await removeFromTracked(tracking);
 });
 
-// 5) /health
 app.get('/health', async (req, res) => {
   res.json({
     ok: true,
+    version: '6.0-multi-store',
     storage: getRedis() ? 'redis' : 'memory',
+    stores:  STORES.map(s => ({ name: s.name, domains: s.domains.length, hasSecret: !!s.secret, hasPixel: !!s.pixelId })),
     orders: await store.orderCount(),
     tracking: await store.trackingCount(),
+    tracked: getRedis() ? (await rKeys('tracked:*')).length : 0,
     uptime: Math.floor(process.uptime()) + 's',
   });
+});
+
+app.post('/admin/poll', (req, res) => {
+  res.json({ started: true, alreadyRunning: pollRunning });
+  pollBostaDeliveries();
 });
 
 // ══════════════════════════════════════════════════════════
 // CORE LOGIC
 // ══════════════════════════════════════════════════════════
 
-async function handleNewOrder(order) {
-  console.log(`[New Order] ${order.id.slice(-8)} -- ${order.full_name} -- ${order.total_cost} EGP`);
+async function handleNewOrder(order, fromStore) {
+  console.log(`[New Order/${fromStore.name}] ${order.id.slice(-8)} -- ${order.full_name} -- ${order.total_cost} EGP`);
 
-  // اجلب signals (من link-session أو time-based)
   const linkRecord = await store.getSignal('link_' + order.id);
   const sessionId  = linkRecord?.sessionId || null;
   let signals      = sessionId ? (await store.getSignal(sessionId) || {}) : {};
@@ -270,28 +314,22 @@ async function handleNewOrder(order) {
 
   console.log(`[Signals] fbp:${signals.fbp?'v':'x'} fbc:${signals.fbc?'v':'x'} ip:${signals.clientIp?'v':'x'}`);
 
-  // احفظ الأوردر بكل البيانات التحسينية
   await store.setOrder(order.id, {
     orderId:    order.id,
+    storeIndex: fromStore.index,
+    storeName:  fromStore.name,
     totalCost:  order.total_cost,
     phone:      order.phone,
-    email:      order.email      || null,         // ✓ يحسّن EMQ
-    fullName:   order.full_name  || '',
+    email:      order.email || null,
+    fullName:   order.full_name || '',
     city:       order.government || '',
-    cartItems:  order.cart_items || [],           // ✓ content_ids
+    cartItems:  order.cart_items || [],
     createdAt:  order.created_at || new Date().toISOString(),
-    signals,                                       // ✓ fbp/fbc/ip/userAgent
+    signals,
   });
 }
 
-/**
- * المنطق الجوهري الجديد:
- * - نسأل Bosta API للحصول على كل البيانات
- * - نحاول إيجاد الأوردر في Redis لتحسين البيانات (fbp/fbc/email/content_ids/order_id)
- * - نبعت Event لـ Meta مهما كان
- */
-async function processBostaShipment(tracking, state, processedKey) {
-  // اجلب البيانات الكاملة من Bosta API
+async function processBostaShipment(tracking, stateRaw, processedKey) {
   const bosta = await fetchBostaDelivery(tracking);
   if (!bosta) {
     console.warn(`[Bosta] couldn't fetch delivery for ${tracking}`);
@@ -299,54 +337,54 @@ async function processBostaShipment(tracking, state, processedKey) {
   }
 
   console.log(`[Bosta API] phone:${bosta.phone} city:${bosta.city} cod:${bosta.cod}`);
-
-  // طبّق dedup هنا (أنشأناه بعد جلب البيانات لأن الـ Bosta API call قد يفشل)
   await rSet(`sig:${processedKey}`, { ts: Date.now() }, CONFIG.PROCESSED_TTL);
 
-  // ابحث عن الأوردر في Redis لإضافة بيانات تحسينية
   let enrichment = null;
-  const normPhone = normalizePhone(bosta.phone);
-
-  // أولاً: عبر tracking number (لو ربطناه قبل)
   let orderId = await store.getTracking(tracking);
   if (orderId) enrichment = await store.getOrder(orderId);
 
-  // ثانياً: عبر businessReference (لو Bosta بيرجعها كـ Easy Orders order_id)
   if (!enrichment && bosta.businessReference) {
     const byRef = await store.getOrder(bosta.businessReference);
     if (byRef) {
-      enrichment = byRef;
-      orderId = bosta.businessReference;
+      enrichment = byRef; orderId = bosta.businessReference;
       await store.setTracking(tracking, orderId);
-      console.log(`[Match] by businessReference -> ${orderId.slice(-8)}`);
+      console.log(`[Match] by businessReference -> ${orderId.slice(-8)} (store ${byRef.storeName})`);
     }
   }
 
-  // ثالثاً: عبر phone (للأوردرات اللي مالهاش tracking مسجل)
-  if (!enrichment && normPhone) {
+  if (!enrichment && bosta.phone) {
+    const normPhone = normalizePhone(bosta.phone);
     const allOrders = await store.getAllOrders();
+    // اختر الأحدث لو موجود في أكثر من متجر
+    let latest = null, latestTs = 0;
     for (const o of allOrders) {
       if (normalizePhone(o.phone) === normPhone) {
-        enrichment = o;
-        orderId = o.orderId;
-        await store.setTracking(tracking, orderId);
-        console.log(`[Match] by phone -> ${orderId.slice(-8)}`);
-        break;
+        const ts = new Date(o.createdAt).getTime();
+        if (ts > latestTs) { latest = o; latestTs = ts; }
       }
+    }
+    if (latest) {
+      enrichment = latest; orderId = latest.orderId;
+      await store.setTracking(tracking, orderId);
+      console.log(`[Match] by phone -> ${orderId.slice(-8)} (store ${latest.storeName})`);
     }
   }
 
+  // حدد المتجر اللي هنبعت لـ Pixel بتاعه
+  const targetStore = (enrichment?.storeIndex !== undefined && STORES[enrichment.storeIndex])
+    ? STORES[enrichment.storeIndex]
+    : DEFAULT_STORE;
+
   if (enrichment) {
-    console.log(`[Enrich] email:${enrichment.email?'v':'x'} fbp:${enrichment.signals?.fbp?'v':'x'} content_ids:${enrichment.cartItems?.length || 0}`);
+    console.log(`[Enrich/${targetStore.name}] email:${enrichment.email?'v':'x'} fbp:${enrichment.signals?.fbp?'v':'x'} content_ids:${enrichment.cartItems?.length || 0}`);
   } else {
-    console.log(`[Enrich] no Redis match -- will send Bosta data only`);
+    console.log(`[Enrich/${targetStore.name}] no Redis match -- Bosta data only`);
   }
 
-  // ابعت Event لـ Meta
-  if (isDelivered(state)) {
-    await sendMetaEvent('Delivery', bosta, enrichment, tracking);
-  } else if (isReturned(state)) {
-    await sendMetaEvent('OrderReturned', bosta, enrichment, tracking, state);
+  if (isDelivered(stateRaw)) {
+    await sendMetaEvent('Delivery', bosta, enrichment, tracking, null, targetStore);
+  } else if (isReturned(stateRaw)) {
+    await sendMetaEvent('OrderReturned', bosta, enrichment, tracking, stateRaw, targetStore);
   }
 }
 
@@ -370,7 +408,6 @@ async function fetchBostaDelivery(trackingNumber) {
       cod:               d?.cod ?? null,
       businessReference: d?.businessReference || null,
       creationDate:      d?.creationTimestamp || d?.createdAt || null,
-      updateDate:        d?.updatedAt || null,
     };
   } catch (e) {
     console.error('[Bosta API] error:', e.message);
@@ -378,19 +415,22 @@ async function fetchBostaDelivery(trackingNumber) {
   }
 }
 
-async function sendMetaEvent(eventName, bosta, enrichment, tracking, returnReason) {
-  // ─── User Data: Bosta + enrichment ───
+async function sendMetaEvent(eventName, bosta, enrichment, tracking, returnReason, targetStore) {
+  if (!targetStore?.pixelId || !targetStore?.capiToken) {
+    console.warn(`[Meta] store "${targetStore?.name}" بدون pixel/token -- skipped`);
+    return;
+  }
+
   const phone     = bosta.phone || enrichment?.phone;
-  const firstName = bosta.firstName || enrichment?.fullName?.split(' ')[0]              || '';
+  const firstName = bosta.firstName || enrichment?.fullName?.split(' ')[0] || '';
   const lastName  = bosta.lastName  || enrichment?.fullName?.split(' ').slice(1).join(' ') || '';
   const city      = bosta.city      || enrichment?.city;
-  const email     = enrichment?.email; // Email من Easy Orders فقط
+  const email     = enrichment?.email;
   const fbp       = enrichment?.signals?.fbp;
   const fbc       = enrichment?.signals?.fbc;
   const clientIp  = enrichment?.signals?.clientIp;
   const userAgent = enrichment?.signals?.userAgent;
 
-  // ─── Custom Data: Bosta + enrichment ───
   const value       = bosta.cod || enrichment?.totalCost;
   const contentIds  = enrichment?.cartItems?.map(i => i.product_id) || [];
   const orderId     = enrichment?.orderId || bosta.businessReference || tracking;
@@ -398,8 +438,6 @@ async function sendMetaEvent(eventName, bosta, enrichment, tracking, returnReaso
     ? Math.round((Date.now() - new Date(enrichment.createdAt).getTime()) / 86400000)
     : null;
 
-  // ─── Event ID للـ deduplication ───
-  // نستخدم order_id لو متوفر، وإلا tracking
   const eventId = `${eventName.toLowerCase()}_${orderId}`;
 
   const payload = {
@@ -409,13 +447,13 @@ async function sendMetaEvent(eventName, bosta, enrichment, tracking, returnReaso
       action_source: 'website',
       event_id:      eventId,
       user_data: {
-        em:                email     ? [sha256(email)]                     : undefined,
-        ph:                phone     ? [sha256(phoneForMeta(phone))]       : undefined,
-        fn:                firstName ? [sha256(firstName)]                 : undefined,
-        ln:                lastName  ? [sha256(lastName)]                  : undefined,
-        ct:                city      ? [sha256(city.toLowerCase())]        : undefined,
+        em:                email     ? [sha256(email)]                  : undefined,
+        ph:                phone     ? [sha256(phoneForMeta(phone))]    : undefined,
+        fn:                firstName ? [sha256(firstName)]              : undefined,
+        ln:                lastName  ? [sha256(lastName)]               : undefined,
+        ct:                city      ? [sha256(city.toLowerCase())]     : undefined,
         country:           [sha256('eg')],
-        external_id:       orderId   ? [sha256(orderId)]                   : undefined,  // ✓ extra EMQ
+        external_id:       orderId   ? [sha256(orderId)]                : undefined,
         fbp:               fbp       || undefined,
         fbc:               fbc       || undefined,
         client_ip_address: clientIp  || undefined,
@@ -431,60 +469,122 @@ async function sendMetaEvent(eventName, bosta, enrichment, tracking, returnReaso
         payment_method: 'cod',
         delivery_city:  city,
         delivery_days:  deliveryDays,
+        store_name:     targetStore.name,
         ...(returnReason ? { return_reason: String(returnReason) } : {}),
       },
     }],
   };
 
   try {
-    const url = `${CONFIG.META_CAPI_BASE}/${CONFIG.META_PIXEL_ID}/events?access_token=${CONFIG.META_CAPI_TOKEN}`;
+    const url = `${CONFIG.META_CAPI_BASE}/${targetStore.pixelId}/events?access_token=${targetStore.capiToken}`;
     const res = await apiCall('POST', url, JSON.parse(JSON.stringify(payload)));
-    console.log(`[Meta] ${eventName} -> ${res.status} events_received:${res.body?.events_received ?? '?'} event_id:${eventId}`);
+    console.log(`[Meta/${targetStore.name}] ${eventName} -> ${res.status} events_received:${res.body?.events_received ?? '?'} event_id:${eventId}`);
     if (res.status !== 200) {
       console.warn(`[Meta] response body:`, JSON.stringify(res.body).slice(0, 300));
     }
   } catch (e) {
-    console.error(`[Meta] ${eventName} error:`, e.message);
+    console.error(`[Meta/${targetStore.name}] ${eventName} error:`, e.message);
   }
 }
 
-// ──────────────────────────────────────────────────────────
-// Polling: كل ساعة، فحص آخر الشحنات من Bosta
-// ──────────────────────────────────────────────────────────
-const POLL_INTERVAL_MS = 60 * 60 * 1000;
-const POLL_PAGE_LIMIT  = 50;
-const POLL_MAX_PAGES   = 10;
+// ══════════════════════════════════════════════════════════
+// POLLING — Hybrid Strategy:
+//   A) Recent: آخر 50 شحنة (page 0 only - الـ API لا يدعم pagination)
+//   B) Tracked: كل tracking معروف لسه pending
+// ══════════════════════════════════════════════════════════
+const POLL_INTERVAL_MS    = 60 * 60 * 1000;          // كل ساعة
+const POLL_PAGE_LIMIT     = 50;
+const TRACKED_KEY         = 'tracked';               // قائمة الـ trackings المعروفة
+const TRACKED_TTL         = 30 * 24 * 60 * 60;
 let pollRunning = false;
 
+// إضافة tracking للقائمة المُتابَعة في Redis
+async function addToTracked(tracking, storeIndex) {
+  await rSet(`tracked:${tracking}`, {
+    tracking,
+    storeIndex: storeIndex ?? null,
+    addedAt: Date.now(),
+  }, TRACKED_TTL);
+}
+
+// حذف tracking من القائمة (لما يتسلّم أو يُرجع)
+async function removeFromTracked(tracking) {
+  await rDel(`tracked:${tracking}`);
+}
+
+// جلب كل الـ trackings المتابَعة
+async function getTrackedList() {
+  if (!getRedis()) return [];
+  const keys = await rKeys('tracked:*');
+  const results = [];
+  for (const k of keys) {
+    const v = await rGet(k);
+    if (v) results.push(v);
+  }
+  return results;
+}
+
 async function pollBostaDeliveries() {
-  if (pollRunning) { console.log('[Poll] dropped - previous cycle running'); return; }
+  if (pollRunning) { console.log('[Poll] dropped - previous running'); return; }
   pollRunning = true;
   console.log('[Poll] ===== Starting Bosta poll =====');
-  let totalScanned = 0, totalSent = 0;
+  let recentScanned = 0, recentSent = 0, trackedScanned = 0, trackedSent = 0;
 
   try {
-    for (let page = 0; page < POLL_MAX_PAGES; page++) {
-      const url = `${CONFIG.BOSTA_BASE}/deliveries/search`;
-      const body = { pageNumber: page, pageLimit: POLL_PAGE_LIMIT };
-      const res = await apiCall('POST', url, body, { 'Authorization': CONFIG.BOSTA_API_KEY });
-      if (res.status !== 200) { console.warn(`[Poll] page ${page} -> ${res.status}`); break; }
+    // ── PART A: آخر 50 شحنة ──────────────────────────────
+    console.log('[Poll/A] Fetching latest 50 deliveries...');
+    const url  = `${CONFIG.BOSTA_BASE}/deliveries/search`;
+    const body = { pageLimit: POLL_PAGE_LIMIT };
+    const res  = await apiCall('POST', url, body, { 'Authorization': CONFIG.BOSTA_API_KEY });
 
+    if (res.status === 200) {
       const deliveries = res.body?.data?.deliveries || [];
-      if (!deliveries.length) break;
-      console.log(`[Poll] Page ${page}: ${deliveries.length} deliveries`);
+      console.log(`[Poll/A] Got ${deliveries.length} recent deliveries`);
 
       for (const d of deliveries) {
-        totalScanned++;
+        recentScanned++;
         const tracking = d.trackingNumber || d._id;
         const state    = d.state?.code ?? d.state?.value ?? d.state ?? 0;
+
+        // سجّل الـ tracking للمتابعة المستقبلية (سواء تسلّم أو لا)
+        await addToTracked(tracking, null);
 
         if (!isDelivered(state) && !isReturned(state)) continue;
 
         const processedKey = `processed_${tracking}_${state}`;
-        if (await store.getSignal(processedKey)) continue;
-
+        if (await store.getSignal(processedKey)) {
+          await removeFromTracked(tracking); // معالج → اشطبه من المتابعة
+          continue;
+        }
         await processBostaShipment(tracking, state, processedKey);
-        totalSent++;
+        await removeFromTracked(tracking);
+        recentSent++;
+      }
+    } else {
+      console.warn(`[Poll/A] returned ${res.status}`);
+    }
+
+    // ── PART B: كل tracking في القائمة المتابعة ──────────
+    const tracked = await getTrackedList();
+    console.log(`[Poll/B] Checking ${tracked.length} tracked shipments...`);
+
+    for (const t of tracked) {
+      trackedScanned++;
+      const bosta = await fetchBostaDelivery(t.tracking);
+      if (!bosta) continue;
+
+      const state = await getTrackingState(t.tracking);
+      if (state === null) continue;
+
+      if (isDelivered(state) || isReturned(state)) {
+        const processedKey = `processed_${t.tracking}_${state}`;
+        if (await store.getSignal(processedKey)) {
+          await removeFromTracked(t.tracking);
+          continue;
+        }
+        await processBostaShipment(t.tracking, state, processedKey);
+        await removeFromTracked(t.tracking);
+        trackedSent++;
       }
     }
   } catch (e) {
@@ -493,56 +593,42 @@ async function pollBostaDeliveries() {
     pollRunning = false;
   }
 
-  console.log(`[Poll] ===== Done: scanned ${totalScanned}, sent ${totalSent} =====`);
+  console.log(`[Poll] ===== Done: recent ${recentScanned}/${recentSent}, tracked ${trackedScanned}/${trackedSent} =====`);
+}
+
+// مساعدة: جلب state من Bosta API
+async function getTrackingState(tracking) {
+  try {
+    const url = `${CONFIG.BOSTA_BASE}/deliveries/business/${tracking}`;
+    const res = await apiCall('GET', url, null, { 'Authorization': CONFIG.BOSTA_API_KEY });
+    if (res.status !== 200) return null;
+    const d = res.body?.data || res.body;
+    return d?.state?.code ?? d?.state?.value ?? d?.state ?? null;
+  } catch (e) {
+    return null;
+  }
 }
 
 setInterval(pollBostaDeliveries, POLL_INTERVAL_MS);
 setTimeout(pollBostaDeliveries, 2 * 60 * 1000);
 
-app.post('/admin/poll', (req, res) => {
-  res.json({ started: true, alreadyRunning: pollRunning });
-  pollBostaDeliveries();
-});
-
-// ──────────────────────────────────────────────────────────
-
-/**
- * test-page-size.js
- * ===================
- * نختبر أقصى pageLimit يدعمه Bosta API
- */
-app.get('/admin/test-page-size', async (req, res) => {
-  const url = `${CONFIG.BOSTA_BASE}/deliveries/search`;
-  const headers = { 'Authorization': CONFIG.BOSTA_API_KEY };
-
-  const sizes = [50, 100, 200, 500, 1000, 2000];
-  const results = [];
-
-  console.log(`\n===== [PAGE SIZE TEST] =====`);
-  for (const size of sizes) {
-    try {
-      const t0 = Date.now();
-      const r = await apiCall('POST', url, { pageLimit: size }, headers);
-      const ms = Date.now() - t0;
-      const count = r.body?.data?.deliveries?.length || 0;
-      const total = r.body?.data?.count || r.body?.data?.totalCount || '?';
-      console.log(`[SIZE] pageLimit:${size} -> status:${r.status} count:${count} total:${total} time:${ms}ms`);
-      results.push({ requested: size, status: r.status, actual: count, total, ms });
-    } catch (e) {
-      console.log(`[SIZE] pageLimit:${size} ERROR: ${e.message}`);
-      results.push({ requested: size, error: e.message });
-    }
-  }
-
-  res.json({ results });
-});
-
-
+// ══════════════════════════════════════════════════════════
+// START
+// ══════════════════════════════════════════════════════════
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`\nCOD Meta Tracking v5.0 -- Port ${PORT}`);
-  console.log(`Storage: ${getRedis() ? 'Redis' : 'Memory'}`);
-  console.log(`Bosta = source of truth, Redis = enrichment\n`);
+  console.log(`\n╔════════════════════════════════════════════╗`);
+  console.log(`║   COD Meta Tracking v6.0 — Multi-Store    ║`);
+  console.log(`╠════════════════════════════════════════════╣`);
+  console.log(`║  Port    : ${String(PORT).padEnd(32)}║`);
+  console.log(`║  Storage : ${(getRedis() ? 'Redis ✓' : 'Memory ⚠').padEnd(32)}║`);
+  console.log(`║  Stores  : ${String(STORES.length).padEnd(32)}║`);
+  console.log(`║  Origins : ${String(ALLOWED_ORIGINS.size).padEnd(32)}║`);
+  console.log(`╠════════════════════════════════════════════╣`);
+  for (const s of STORES) {
+    console.log(`║  • ${s.name.padEnd(12)} pixel:${s.pixelId ? '✓' : '✗'} secret:${s.secret ? '✓' : '✗'} dom:${String(s.domains.length).padEnd(2)} ║`);
+  }
+  console.log(`╚════════════════════════════════════════════╝\n`);
 });
 
 module.exports = app;
