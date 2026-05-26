@@ -614,95 +614,94 @@ setTimeout(pollBostaDeliveries, 2 * 60 * 1000);
 
 // ══════════════════════════════════════════════════════════
 // START
+
 /**
- * test-v0-limits.js
- * ===================
- * نختبر الحد الأعلى لـ limit في الـ v0 endpoint الجديد
- * + نختبر الـ filtering بـ phone و businessReference
+ * test-correct-pagination.js
+ * ===========================
+ * نختبر الـ params الصحيحة اللي اكتشفناها من Bosta dashboard:
+ *   { limit, page, sortBy }
  *
- * Usage: /admin/test-v0-limits
+ * نختبرها مع كل من API Key العادي
  */
 
-app.get('/admin/test-v0-limits', async (req, res) => {
-  const phone   = req.query.phone || '01032609691'; // اختر هاتف فعلي
-  const baseUrl = 'https://app.bosta.co/api/v0/deliveries';
+app.get('/admin/test-correct-pagination', async (req, res) => {
+  const url = `${CONFIG.BOSTA_BASE}/deliveries/search`;
   const headers = { 'Authorization': CONFIG.BOSTA_API_KEY };
 
-  console.log(`\n===== [V0 LIMITS TEST] =====`);
+  console.log(`\n===== [CORRECT PAGINATION TEST] =====`);
 
-  // PART 1: اختبر max limit
-  const limits = [10, 50, 100, 200, 500, 1000, 2000, 5000];
-  const limitResults = [];
+  const tests = [
+    // الصيغة اللي يستخدمها Bosta Dashboard
+    { name: 'page:1 + limit + sortBy',  body: { page: 1, limit: 50, sortBy: '-updatedAt' } },
+    { name: 'page:2 + limit + sortBy',  body: { page: 2, limit: 50, sortBy: '-updatedAt' } },
+    { name: 'page:3 + limit + sortBy',  body: { page: 3, limit: 50, sortBy: '-updatedAt' } },
+    { name: 'page:5 + limit + sortBy',  body: { page: 5, limit: 50, sortBy: '-updatedAt' } },
 
-  for (const lim of limits) {
+    // بدون sortBy
+    { name: 'page:1 + limit (no sort)', body: { page: 1, limit: 50 } },
+    { name: 'page:2 + limit (no sort)', body: { page: 2, limit: 50 } },
+
+    // limit عالي - هل بيشتغل الآن مع الـ page الصحيحة؟
+    { name: 'page:1 + limit:100',       body: { page: 1, limit: 100, sortBy: '-updatedAt' } },
+    { name: 'page:1 + limit:200',       body: { page: 1, limit: 200, sortBy: '-updatedAt' } },
+    { name: 'page:1 + limit:500',       body: { page: 1, limit: 500, sortBy: '-updatedAt' } },
+  ];
+
+  const results = [];
+  for (const t of tests) {
     try {
       const t0 = Date.now();
-      const url = `${baseUrl}?limit=${lim}`;
-      const r = await apiCall('GET', url, null, headers);
+      const r = await apiCall('POST', url, t.body, headers);
       const ms = Date.now() - t0;
 
-      const deliveries = r.body?.data?.deliveries || r.body?.deliveries || r.body?.data || (Array.isArray(r.body) ? r.body : []);
-      const count = Array.isArray(deliveries) ? deliveries.length : 0;
-      const total = r.body?.data?.count || r.body?.data?.totalCount || r.body?.count || r.body?.total || '?';
+      const deliveries = r.body?.data?.deliveries || [];
+      const count = deliveries.length;
+      const total = r.body?.data?.count || r.body?.data?.totalCount || '?';
+      const firstId = deliveries[0]?._id || 'N/A';
+      const firstTracking = deliveries[0]?.trackingNumber || 'N/A';
 
-      console.log(`[V0 LIMIT] limit=${String(lim).padEnd(5)} status:${r.status} count:${count} total:${total} time:${ms}ms`);
-      limitResults.push({ requested: lim, status: r.status, actual: count, total, ms });
+      console.log(`[PAG] ${t.name.padEnd(35)} status:${r.status} count:${count} total:${total} first:${firstId.slice(-10)} tracking:${firstTracking} time:${ms}ms`);
+      results.push({
+        name: t.name, body: t.body, status: r.status, count, total, firstId, firstTracking, ms,
+      });
     } catch (e) {
-      console.log(`[V0 LIMIT] limit=${lim} ERROR: ${e.message}`);
+      console.log(`[PAG] ${t.name} ERROR: ${e.message}`);
     }
   }
 
-  // PART 2: اختبر filtering بالـ phone في v0
-  console.log(`\n[V0 FILTER TEST]`);
-  const filterTests = [
-    { name: 'phone (query)',        params: `?phone=${phone}&limit=5` },
-    { name: 'mobile (query)',       params: `?mobile=${phone}&limit=5` },
-    { name: 'receiverPhone',        params: `?receiverPhone=${phone}&limit=5` },
-    { name: 'receiver.phone',       params: `?receiver.phone=${phone}&limit=5` },
-    { name: 'search (query)',       params: `?search=${phone}&limit=5` },
-    { name: 'q (query)',            params: `?q=${phone}&limit=5` },
-  ];
-  const filterResults = [];
+  // مقارنة: هل الـ first IDs مختلفة بين الصفحات؟
+  const p1 = results.find(r => r.name === 'page:1 + limit + sortBy');
+  const p2 = results.find(r => r.name === 'page:2 + limit + sortBy');
+  const p3 = results.find(r => r.name === 'page:3 + limit + sortBy');
+  const p5 = results.find(r => r.name === 'page:5 + limit + sortBy');
 
-  for (const t of filterTests) {
-    try {
-      const url = `${baseUrl}${t.params}`;
-      const r = await apiCall('GET', url, null, headers);
-      const deliveries = r.body?.data?.deliveries || r.body?.deliveries || r.body?.data || [];
-      const count = Array.isArray(deliveries) ? deliveries.length : 0;
-      const firstPhone = deliveries[0]?.receiver?.phone || 'N/A';
-      const matchedPhone = firstPhone && (firstPhone.includes(phone) || phone.includes(firstPhone.replace('+20','')));
-      const tag = matchedPhone ? '✓ FILTERED' : (count < 5 && count > 0 ? '? maybe' : '✗ no filter');
-      console.log(`[V0 FILTER] ${t.name.padEnd(20)} count:${count} firstPhone:${firstPhone} ${tag}`);
-      filterResults.push({ name: t.name, params: t.params, count, firstPhone, looksFiltered: matchedPhone });
-    } catch (e) {
-      console.log(`[V0 FILTER] ${t.name} ERROR: ${e.message}`);
-    }
-  }
-
-  // VERDICT
   console.log(`\n===== VERDICT =====`);
-  const maxWorkingLimit = limitResults.filter(r => r.actual === r.requested).map(r => r.requested).pop() || 0;
-  const maxActualReturned = Math.max(...limitResults.map(r => r.actual || 0));
-  console.log(`Max limit that works as-is: ${maxWorkingLimit}`);
-  console.log(`Max actual count returned: ${maxActualReturned}`);
+  const paginationWorks = p1 && p2 && p1.firstId !== p2.firstId && p1.firstId !== 'N/A';
+  console.log(`Pagination works: ${paginationWorks ? '✓ YES!' : '✗ NO'}`);
+  if (paginationWorks) {
+    console.log(`Page 1 first: ${p1.firstId}`);
+    console.log(`Page 2 first: ${p2.firstId}`);
+    console.log(`Page 3 first: ${p3?.firstId}`);
+    console.log(`Page 5 first: ${p5?.firstId}`);
+  }
 
-  const workingFilters = filterResults.filter(f => f.looksFiltered);
-  console.log(`Working phone filters: ${workingFilters.length}`);
-  for (const f of workingFilters) console.log(`  ✓ ${f.name}`);
+  // ما هو الـ max limit؟
+  const limitTests = results.filter(r => r.name.includes('limit:'));
+  const maxActual = Math.max(...results.map(r => r.count || 0));
+  console.log(`Max actual count returned: ${maxActual}`);
   console.log(`===================\n`);
 
   res.json({
     summary: {
-      maxLimitWorks: maxWorkingLimit,
-      maxActualReturned,
-      phoneFilterWorks: workingFilters.length > 0,
-      workingFilters: workingFilters.map(f => f.name),
+      paginationWorks,
+      maxActualReturned: maxActual,
+      pageOneFirstId: p1?.firstId,
+      pageTwoFirstId: p2?.firstId,
     },
-    limitResults,
-    filterResults,
+    results,
   });
 });
+
 // ══════════════════════════════════════════════════════════
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
