@@ -256,20 +256,12 @@ app.post('/webhook/bosta', async (req, res) => {
 
   console.log(`[Bosta] ${tracking} -> ${stateRaw}`);
 
-  // سجّل الـ tracking للمتابعة المستقبلية (مهما كانت الحالة)
-  await addToTracked(tracking, null);
-
   if (!isDelivered(stateRaw) && !isReturned(stateRaw)) return;
 
   const processedKey = `processed_${tracking}_${stateRaw}`;
-  if (await store.getSignal(processedKey)) {
-    console.log(`[Bosta] already processed`);
-    await removeFromTracked(tracking);
-    return;
-  }
+  if (await store.getSignal(processedKey)) { console.log(`[Bosta] already processed`); return; }
 
   await processBostaShipment(tracking, stateRaw, processedKey);
-  await removeFromTracked(tracking);
 });
 
 app.get('/health', async (req, res) => {
@@ -280,7 +272,6 @@ app.get('/health', async (req, res) => {
     stores:  STORES.map(s => ({ name: s.name, domains: s.domains.length, hasSecret: !!s.secret, hasPixel: !!s.pixelId })),
     orders: await store.orderCount(),
     tracking: await store.trackingCount(),
-    tracked: getRedis() ? (await rKeys('tracked:*')).length : 0,
     uptime: Math.floor(process.uptime()) + 's',
   });
 });
@@ -488,103 +479,55 @@ async function sendMetaEvent(eventName, bosta, enrichment, tracking, returnReaso
 }
 
 // ══════════════════════════════════════════════════════════
-// POLLING — Hybrid Strategy:
-//   A) Recent: آخر 50 شحنة (page 0 only - الـ API لا يدعم pagination)
-//   B) Tracked: كل tracking معروف لسه pending
+// POLLING v7.0 — Real Pagination
+// =============================
+// اكتشفنا إن Bosta API يدعم pagination الحقيقية بـ:
+//   { page: N, limit: 200, sortBy: '-updatedAt' }
+// نسحب 600 شحنة كل ساعة (3 pages × 200) في ~9 ثوان
 // ══════════════════════════════════════════════════════════
 const POLL_INTERVAL_MS    = 60 * 60 * 1000;          // كل ساعة
-const POLL_PAGE_LIMIT     = 50;
-const TRACKED_KEY         = 'tracked';               // قائمة الـ trackings المعروفة
-const TRACKED_TTL         = 30 * 24 * 60 * 60;
+const POLL_PAGE_LIMIT     = 200;                     // 200 شحنة/صفحة (sweet spot)
+const POLL_MAX_PAGES      = 3;                       // 3 صفحات = 600 شحنة كل دورة
 let pollRunning = false;
-
-// إضافة tracking للقائمة المُتابَعة في Redis
-async function addToTracked(tracking, storeIndex) {
-  await rSet(`tracked:${tracking}`, {
-    tracking,
-    storeIndex: storeIndex ?? null,
-    addedAt: Date.now(),
-  }, TRACKED_TTL);
-}
-
-// حذف tracking من القائمة (لما يتسلّم أو يُرجع)
-async function removeFromTracked(tracking) {
-  await rDel(`tracked:${tracking}`);
-}
-
-// جلب كل الـ trackings المتابَعة
-async function getTrackedList() {
-  if (!getRedis()) return [];
-  const keys = await rKeys('tracked:*');
-  const results = [];
-  for (const k of keys) {
-    const v = await rGet(k);
-    if (v) results.push(v);
-  }
-  return results;
-}
 
 async function pollBostaDeliveries() {
   if (pollRunning) { console.log('[Poll] dropped - previous running'); return; }
   pollRunning = true;
   console.log('[Poll] ===== Starting Bosta poll =====');
-  let recentScanned = 0, recentSent = 0, trackedScanned = 0, trackedSent = 0;
+  let totalScanned = 0, totalSent = 0;
+  const t0 = Date.now();
 
   try {
-    // ── PART A: آخر 50 شحنة ──────────────────────────────
-    console.log('[Poll/A] Fetching latest 50 deliveries...');
-    const url  = `${CONFIG.BOSTA_BASE}/deliveries/search`;
-    const body = { pageLimit: POLL_PAGE_LIMIT };
-    const res  = await apiCall('POST', url, body, { 'Authorization': CONFIG.BOSTA_API_KEY });
+    for (let page = 1; page <= POLL_MAX_PAGES; page++) {
+      const url  = `${CONFIG.BOSTA_BASE}/deliveries/search`;
+      const body = { page, limit: POLL_PAGE_LIMIT, sortBy: '-updatedAt' };
+      const pageStart = Date.now();
+      const res  = await apiCall('POST', url, body, { 'Authorization': CONFIG.BOSTA_API_KEY });
 
-    if (res.status === 200) {
+      if (res.status !== 200) {
+        console.warn(`[Poll] page ${page} -> ${res.status}`);
+        break;
+      }
+
       const deliveries = res.body?.data?.deliveries || [];
-      console.log(`[Poll/A] Got ${deliveries.length} recent deliveries`);
+      const pageMs = Date.now() - pageStart;
+      console.log(`[Poll] page ${page}: ${deliveries.length} deliveries (${pageMs}ms)`);
+
+      if (deliveries.length === 0) break;
 
       for (const d of deliveries) {
-        recentScanned++;
+        totalScanned++;
         const tracking = d.trackingNumber || d._id;
         const state    = d.state?.code ?? d.state?.value ?? d.state ?? 0;
 
-        // سجّل الـ tracking للمتابعة المستقبلية (سواء تسلّم أو لا)
-        await addToTracked(tracking, null);
-
+        // فقط الحالات النهائية تهمنا
         if (!isDelivered(state) && !isReturned(state)) continue;
 
         const processedKey = `processed_${tracking}_${state}`;
-        if (await store.getSignal(processedKey)) {
-          await removeFromTracked(tracking); // معالج → اشطبه من المتابعة
-          continue;
-        }
+        if (await store.getSignal(processedKey)) continue;
+
         await processBostaShipment(tracking, state, processedKey);
-        await removeFromTracked(tracking);
-        recentSent++;
-      }
-    } else {
-      console.warn(`[Poll/A] returned ${res.status}`);
-    }
-
-    // ── PART B: كل tracking في القائمة المتابعة ──────────
-    const tracked = await getTrackedList();
-    console.log(`[Poll/B] Checking ${tracked.length} tracked shipments...`);
-
-    for (const t of tracked) {
-      trackedScanned++;
-      const bosta = await fetchBostaDelivery(t.tracking);
-      if (!bosta) continue;
-
-      const state = await getTrackingState(t.tracking);
-      if (state === null) continue;
-
-      if (isDelivered(state) || isReturned(state)) {
-        const processedKey = `processed_${t.tracking}_${state}`;
-        if (await store.getSignal(processedKey)) {
-          await removeFromTracked(t.tracking);
-          continue;
-        }
-        await processBostaShipment(t.tracking, state, processedKey);
-        await removeFromTracked(t.tracking);
-        trackedSent++;
+        totalSent++;
       }
     }
   } catch (e) {
@@ -593,20 +536,8 @@ async function pollBostaDeliveries() {
     pollRunning = false;
   }
 
-  console.log(`[Poll] ===== Done: recent ${recentScanned}/${recentSent}, tracked ${trackedScanned}/${trackedSent} =====`);
-}
-
-// مساعدة: جلب state من Bosta API
-async function getTrackingState(tracking) {
-  try {
-    const url = `${CONFIG.BOSTA_BASE}/deliveries/business/${tracking}`;
-    const res = await apiCall('GET', url, null, { 'Authorization': CONFIG.BOSTA_API_KEY });
-    if (res.status !== 200) return null;
-    const d = res.body?.data || res.body;
-    return d?.state?.code ?? d?.state?.value ?? d?.state ?? null;
-  } catch (e) {
-    return null;
-  }
+  const elapsed = Math.round((Date.now() - t0) / 1000);
+  console.log(`[Poll] ===== Done: scanned ${totalScanned}, sent ${totalSent} in ${elapsed}s =====`);
 }
 
 setInterval(pollBostaDeliveries, POLL_INTERVAL_MS);
@@ -614,99 +545,11 @@ setTimeout(pollBostaDeliveries, 2 * 60 * 1000);
 
 // ══════════════════════════════════════════════════════════
 // START
-
-/**
- * test-correct-pagination.js
- * ===========================
- * نختبر الـ params الصحيحة اللي اكتشفناها من Bosta dashboard:
- *   { limit, page, sortBy }
- *
- * نختبرها مع كل من API Key العادي
- */
-
-app.get('/admin/test-correct-pagination', async (req, res) => {
-  const url = `${CONFIG.BOSTA_BASE}/deliveries/search`;
-  const headers = { 'Authorization': CONFIG.BOSTA_API_KEY };
-
-  console.log(`\n===== [CORRECT PAGINATION TEST] =====`);
-
-  const tests = [
-    // الصيغة اللي يستخدمها Bosta Dashboard
-    { name: 'page:1 + limit + sortBy',  body: { page: 1, limit: 50, sortBy: '-updatedAt' } },
-    { name: 'page:2 + limit + sortBy',  body: { page: 2, limit: 50, sortBy: '-updatedAt' } },
-    { name: 'page:3 + limit + sortBy',  body: { page: 3, limit: 50, sortBy: '-updatedAt' } },
-    { name: 'page:5 + limit + sortBy',  body: { page: 5, limit: 50, sortBy: '-updatedAt' } },
-
-    // بدون sortBy
-    { name: 'page:1 + limit (no sort)', body: { page: 1, limit: 50 } },
-    { name: 'page:2 + limit (no sort)', body: { page: 2, limit: 50 } },
-
-    // limit عالي - هل بيشتغل الآن مع الـ page الصحيحة؟
-    { name: 'page:1 + limit:100',       body: { page: 1, limit: 100, sortBy: '-updatedAt' } },
-    { name: 'page:1 + limit:200',       body: { page: 1, limit: 200, sortBy: '-updatedAt' } },
-    { name: 'page:1 + limit:500',       body: { page: 1, limit: 500, sortBy: '-updatedAt' } },
-  ];
-
-  const results = [];
-  for (const t of tests) {
-    try {
-      const t0 = Date.now();
-      const r = await apiCall('POST', url, t.body, headers);
-      const ms = Date.now() - t0;
-
-      const deliveries = r.body?.data?.deliveries || [];
-      const count = deliveries.length;
-      const total = r.body?.data?.count || r.body?.data?.totalCount || '?';
-      const firstId = deliveries[0]?._id || 'N/A';
-      const firstTracking = deliveries[0]?.trackingNumber || 'N/A';
-
-      console.log(`[PAG] ${t.name.padEnd(35)} status:${r.status} count:${count} total:${total} first:${firstId.slice(-10)} tracking:${firstTracking} time:${ms}ms`);
-      results.push({
-        name: t.name, body: t.body, status: r.status, count, total, firstId, firstTracking, ms,
-      });
-    } catch (e) {
-      console.log(`[PAG] ${t.name} ERROR: ${e.message}`);
-    }
-  }
-
-  // مقارنة: هل الـ first IDs مختلفة بين الصفحات؟
-  const p1 = results.find(r => r.name === 'page:1 + limit + sortBy');
-  const p2 = results.find(r => r.name === 'page:2 + limit + sortBy');
-  const p3 = results.find(r => r.name === 'page:3 + limit + sortBy');
-  const p5 = results.find(r => r.name === 'page:5 + limit + sortBy');
-
-  console.log(`\n===== VERDICT =====`);
-  const paginationWorks = p1 && p2 && p1.firstId !== p2.firstId && p1.firstId !== 'N/A';
-  console.log(`Pagination works: ${paginationWorks ? '✓ YES!' : '✗ NO'}`);
-  if (paginationWorks) {
-    console.log(`Page 1 first: ${p1.firstId}`);
-    console.log(`Page 2 first: ${p2.firstId}`);
-    console.log(`Page 3 first: ${p3?.firstId}`);
-    console.log(`Page 5 first: ${p5?.firstId}`);
-  }
-
-  // ما هو الـ max limit؟
-  const limitTests = results.filter(r => r.name.includes('limit:'));
-  const maxActual = Math.max(...results.map(r => r.count || 0));
-  console.log(`Max actual count returned: ${maxActual}`);
-  console.log(`===================\n`);
-
-  res.json({
-    summary: {
-      paginationWorks,
-      maxActualReturned: maxActual,
-      pageOneFirstId: p1?.firstId,
-      pageTwoFirstId: p2?.firstId,
-    },
-    results,
-  });
-});
-
 // ══════════════════════════════════════════════════════════
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`\n╔════════════════════════════════════════════╗`);
-  console.log(`║   COD Meta Tracking v6.0 — Multi-Store    ║`);
+  console.log(`║   COD Meta Tracking v7.0 — Full Pagination║`);
   console.log(`╠════════════════════════════════════════════╣`);
   console.log(`║  Port    : ${String(PORT).padEnd(32)}║`);
   console.log(`║  Storage : ${(getRedis() ? 'Redis ✓' : 'Memory ⚠').padEnd(32)}║`);
