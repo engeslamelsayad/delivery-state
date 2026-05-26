@@ -20,7 +20,7 @@ app.get('/header-script.js', (req, res) => {
 });
 
 const ALLOWED_ORIGINS = [
-  'https://www.trendoraeg.com','https://trendoraeg.myeasyorders.com',
+  'https://www.cosmoeg.shop','https://cosmoeg.shop',
   'https://www.eecm.shop','https://eecm.shop',
 ];
 app.use((req, res, next) => {
@@ -367,71 +367,113 @@ async function sendMetaEvent(eventName, customData, userData, eventId) {
   } catch (e) { console.error(`[Meta] ${eventName} error:`, e.message); }
 }
 
-/**
- * test-bosta-search-v2.js
- * ========================
- * استكشاف دقيق لـ POST /deliveries/search:
- * 1. هل يدعم pagination؟
- * 2. ما هي الصيغة الصحيحة للـ filter بالهاتف؟
- * 3. كم delivery يرجع في الصفحة الواحدة؟
- *
- * Usage:
- *   https://your-app.up.railway.app/admin/test-bosta-search-v2?phone=01234567890
- */
+// ══════════════════════════════════════════════════════════
+// BOSTA POLLING — Safety net عبر POST /deliveries/search
+// ══════════════════════════════════════════════════════════
+const POLL_INTERVAL_MS  = 60 * 60 * 1000;     // كل ساعة
+const POLL_PAGE_LIMIT   = 50;                 // 50 شحنة لكل صفحة
+const POLL_MAX_PAGES    = 10;                 // حد أقصى 500 شحنة في الدورة
+const PROCESSED_TTL     = 30 * 24 * 60 * 60;  // علامة المعالجة تبقى 30 يوم
+let pollRunning = false;
 
-app.get('/admin/test-bosta-search-v2', async (req, res) => {
-  const phone = req.query.phone || '01032609691';
-  const url = `${CONFIG.BOSTA_BASE}/deliveries/search`;
-  const headers = { 'Authorization': CONFIG.BOSTA_API_KEY };
+async function pollBostaDeliveries() {
+  if (pollRunning) {
+    console.log('[Poll] دورة سابقة لسه شغّالة - تجاوز');
+    return;
+  }
+  pollRunning = true;
 
-  console.log(`\n===== [TEST V2] Bosta search exploration =====`);
+  console.log('[Poll] ===== Starting Bosta poll =====');
+  let totalScanned   = 0;
+  let totalNewEvents = 0;
+  let totalMatched   = 0;
 
-  const tests = [
-    // Tests pagination
-    { name: 'Empty body',                   body: {} },
-    { name: 'pageNumber + pageLimit',       body: { pageNumber: 0, pageLimit: 5 } },
-    { name: 'page + limit',                 body: { page: 0, limit: 5 } },
-    { name: 'offset + limit',               body: { offset: 0, limit: 5 } },
+  try {
+    for (let page = 0; page < POLL_MAX_PAGES; page++) {
+      const url = `${CONFIG.BOSTA_BASE}/deliveries/search`;
+      const body = { pageNumber: page, pageLimit: POLL_PAGE_LIMIT };
+      const res = await apiCall('POST', url, body, { 'Authorization': CONFIG.BOSTA_API_KEY });
 
-    // Tests filtering
-    { name: 'phone (direct)',               body: { phone: phone } },
-    { name: 'receiverPhone',                body: { receiverPhone: phone } },
-    { name: 'receiver.phone',               body: { 'receiver.phone': phone } },
-    { name: 'receiver object',              body: { receiver: { phone: phone } } },
-    { name: 'filters.phone',                body: { filters: { phone: phone } } },
-    { name: 'search.phone',                 body: { search: { phone: phone } } },
-    { name: 'query phone',                  body: { query: phone } },
-    { name: 'searchValue',                  body: { searchValue: phone } },
-    { name: 'mobilePhone',                  body: { mobilePhone: phone } },
-  ];
+      if (res.status !== 200) {
+        console.warn(`[Poll] page ${page} returned ${res.status}`);
+        break;
+      }
 
-  const results = [];
+      const deliveries = res.body?.data?.deliveries || [];
+      if (!deliveries.length) {
+        console.log(`[Poll] No more deliveries at page ${page}`);
+        break;
+      }
 
-  for (const t of tests) {
-    try {
-      const r = await apiCall('POST', url, t.body, headers);
-      const data = r.body?.data;
-      const count = data?.deliveries?.length || data?.list?.length || 0;
-      const firstId = data?.deliveries?.[0]?._id || data?.deliveries?.[0]?.trackingNumber || 'N/A';
-      const firstPhone = data?.deliveries?.[0]?.receiver?.phone || 'N/A';
+      console.log(`[Poll] Page ${page}: ${deliveries.length} deliveries`);
 
-      console.log(`[V2] ${t.name.padEnd(28)} → ${r.status} count:${count} first:${firstId} phone:${firstPhone}`);
-      results.push({
-        name: t.name, body: t.body, status: r.status,
-        count, firstId, firstPhone,
-      });
-    } catch (e) {
-      console.log(`[V2] ${t.name} → ERROR: ${e.message}`);
-      results.push({ name: t.name, error: e.message });
+      // اجلب كل الأوردرات مرة واحدة (تحسين أداء)
+      const allOrders = await store.getAllOrders();
+
+      for (const d of deliveries) {
+        totalScanned++;
+        const tracking = d.trackingNumber || d._id;
+        const state    = d.state?.code ?? d.state?.value ?? d.state ?? 0;
+        const phone    = d.receiver?.phone || d.receiver?.secondPhone;
+
+        // نهتم فقط بالحالات النهائية
+        if (!isDelivered(state) && !isReturned(state)) continue;
+
+        // علامة المعالجة - تجنب re-process
+        const processedKey = `processed_${tracking}_${state}`;
+        const already = await store.getSignal(processedKey);
+        if (already) continue;
+
+        const normPhone = normalizePhone(phone);
+        if (!normPhone) continue;
+
+        // ابحث في Redis
+        let orderData = null;
+        for (const o of allOrders) {
+          if (normalizePhone(o.phone) === normPhone) { orderData = o; break; }
+        }
+
+        // fallback لـ Easy Orders
+        if (!orderData) {
+          orderData = await fetchOrderFromEasyOrders(normPhone);
+          if (orderData) {
+            await store.setOrder(orderData.orderId, orderData);
+            allOrders.push(orderData);
+          }
+        }
+
+        if (!orderData) {
+          console.warn(`[Poll] لا أوردر للهاتف: ${normPhone} (tracking: ${tracking})`);
+          continue;
+        }
+
+        // علّم وأرسل
+        await store.setTracking(tracking, orderData.orderId);
+        await handleBostaStatusUpdate(state, orderData);
+        await rSet(`sig:${processedKey}`, { ts: Date.now() }, PROCESSED_TTL);
+        totalMatched++;
+        totalNewEvents++;
+        console.log(`[Poll] ✓ ${tracking} state ${state} -> order ${orderData.orderId.slice(-8)}`);
+      }
     }
+  } catch (e) {
+    console.error('[Poll] error:', e.message);
+  } finally {
+    pollRunning = false;
   }
 
-  console.log(`===== [TEST V2] Done =====\n`);
-  res.json({
-    phone,
-    summary: 'ابحث عن الـ test اللي رجع phone مطابق للـ phone اللي بعتته، أو count مختلف عن باقي الـ tests',
-    results,
-  });
+  console.log(`[Poll] ===== Done: scanned ${totalScanned}, matched ${totalMatched}, new events ${totalNewEvents} =====`);
+}
+
+// شغّل Polling تلقائياً كل ساعة
+setInterval(pollBostaDeliveries, POLL_INTERVAL_MS);
+// أول دورة بعد دقيقتين من بدء السيرفر (وقت لتحميل Redis)
+setTimeout(pollBostaDeliveries, 2 * 60 * 1000);
+
+// Endpoint يدوي لتشغيل Polling فوراً
+app.post('/admin/poll', async (req, res) => {
+  res.json({ started: true, alreadyRunning: pollRunning });
+  pollBostaDeliveries();
 });
 
 const PORT = process.env.PORT || 3000;
