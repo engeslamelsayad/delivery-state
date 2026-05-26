@@ -367,6 +367,59 @@ async function sendMetaEvent(eventName, customData, userData, eventId) {
   } catch (e) { console.error(`[Meta] ${eventName} error:`, e.message); }
 }
 
+/**
+ * test-bosta-phone-search.js
+ * ===========================
+ * ضع هذا الكود في endpoint مؤقت بسيرفرك لاختبار:
+ * هل Bosta API يدعم البحث بالهاتف بأي طريقة؟
+ *
+ * طريقة الاستخدام:
+ *   1. ضع هذا الكود داخل index.js (قبل app.listen)
+ *   2. ارفع على GitHub
+ *   3. اضغط في المتصفح:
+ *      https://your-app.up.railway.app/admin/test-bosta-search?phone=01234567890
+ *      (استبدل الرقم برقم أوردر تعرف إنه موجود في Bosta)
+ *   4. شوف الـ Deploy Logs — ستظهر النتائج لكل endpoint جُرّب
+ */
+
+app.get('/admin/test-bosta-search', async (req, res) => {
+  const phone = req.query.phone || '01234567890';
+  const results = [];
+
+  console.log(`\n===== [TEST] Bosta phone search for ${phone} =====`);
+
+  // قائمة الطرق المحتملة
+  const attempts = [
+    { method: 'GET',  path: `/deliveries/business?phone=${phone}` },
+    { method: 'GET',  path: `/deliveries?phone=${phone}` },
+    { method: 'GET',  path: `/deliveries/search?phone=${phone}` },
+    { method: 'GET',  path: `/deliveries/business?receiver.phone=${phone}` },
+    { method: 'POST', path: `/deliveries/search`, body: { phone } },
+    { method: 'POST', path: `/deliveries/search`, body: { 'receiver.phone': phone } },
+    { method: 'POST', path: `/deliveries/search`, body: { filters: { phone } } },
+    { method: 'POST', path: `/deliveries/business/search`, body: { phone } },
+    { method: 'GET',  path: `/business/deliveries?phone=${phone}` },
+  ];
+
+  for (const a of attempts) {
+    const url = `${CONFIG.BOSTA_BASE}${a.path}`;
+    try {
+      const r = await apiCall(a.method, url, a.body || null, {
+        'Authorization': CONFIG.BOSTA_API_KEY
+      });
+      const sample = JSON.stringify(r.body).slice(0, 150);
+      console.log(`[TEST] ${a.method} ${a.path} → ${r.status}: ${sample}`);
+      results.push({ method: a.method, path: a.path, status: r.status, sample });
+    } catch (e) {
+      console.log(`[TEST] ${a.method} ${a.path} → ERROR: ${e.message}`);
+      results.push({ method: a.method, path: a.path, error: e.message });
+    }
+  }
+
+  console.log(`===== [TEST] Done =====\n`);
+  res.json({ phone, results });
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`\nCOD Meta Tracking v4.0 -- Port ${PORT}`);
