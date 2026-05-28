@@ -15,7 +15,7 @@
   var SERVER         = 'https://delivery-state.up.railway.app';
   var COOKIE_TTL     = 90;
   var POLL_INTERVAL  = 500;   // كل 500ms
-  var POLL_MAX       = 4;     // أقصى 4 محاولات = 2 ثانية
+  var POLL_MAX       = 8;     // أقصى 8 محاولات = 4 ثانية
 
   // ─── Helpers ────────────────────────────────────────────────────
   function getCookie(name) {
