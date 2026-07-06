@@ -76,10 +76,21 @@ const CONFIG = {
 const app = express();
 app.use(express.json());
 
+// ابحث عن header-script.js في كل الأماكن المحتملة (يدعم أي بنية repo)
+const HEADER_SCRIPT_PATH = [
+  path.join(__dirname, '..', 'public', 'header-script.js'),  // src/index.js + public/
+  path.join(__dirname, 'public', 'header-script.js'),        // index.js في الجذر + public/
+  path.join(__dirname, 'header-script.js'),                  // بجانب index.js مباشرة
+].find(p => { try { return require('fs').existsSync(p); } catch { return false; } });
+
+if (HEADER_SCRIPT_PATH) console.log(`[Init] header-script.js -> ${HEADER_SCRIPT_PATH}`);
+else console.warn('[Init] ⚠ header-script.js NOT FOUND in any expected location!');
+
 app.get('/header-script.js', (req, res) => {
+  if (!HEADER_SCRIPT_PATH) return res.status(404).json({ error: 'header-script.js not found on server' });
   res.setHeader('Content-Type',  'application/javascript');
   res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-  res.sendFile(path.join(__dirname, '..', 'public', 'header-script.js'));
+  res.sendFile(HEADER_SCRIPT_PATH);
 });
 
 app.use((req, res, next) => {
