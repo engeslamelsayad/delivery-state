@@ -12,10 +12,10 @@
  * + Cross-domain sessionId via URL param
  */
 (function () {
-  var SERVER         = 'https://delivery-state.up.railway.app';
+  var SERVER         = 'https://YOUR-SERVER.example.com';
   var COOKIE_TTL     = 90;
   var POLL_INTERVAL  = 500;   // كل 500ms
-  var POLL_MAX       = 8;     // أقصى 8 محاولات = 4 ثانية
+  var POLL_MAX       = 8;   // أقصى 8 محاولات = 4 ثوانٍ
 
   // ─── Helpers ────────────────────────────────────────────────────
   function getCookie(name) {
@@ -119,6 +119,51 @@
   } else {
     decorateCheckoutLinks(sessionId);
   }
+
+  // ─── Phone Capture: اربط الهاتف بالـ session لحظة إدخاله ─────────
+  // العميل يكتب هاتفه في فورم الطلب → نرسله مع sessionId للسيرفر
+  // → السيرفر يربط الطلب القادم (بنفس الهاتف) بهذه الجلسة بدقة 100%
+  var lastSentPhone = '';
+
+  function normalizeEgPhone(raw) {
+    var digits = String(raw || '').replace(/\D/g, '');
+    if (digits.indexOf('20') === 0 && digits.length === 12) digits = '0' + digits.slice(2);
+    if (digits.indexOf('1') === 0 && digits.length === 10) digits = '0' + digits;
+    return digits;
+  }
+
+  function maybeSendPhone(raw) {
+    var phone = normalizeEgPhone(raw);
+    // رقم مصري صالح: 11 خانة يبدأ بـ 01
+    if (phone.length === 11 && phone.indexOf('01') === 0 && phone !== lastSentPhone) {
+      lastSentPhone = phone;
+      post('/link-phone', { phone: phone, sessionId: sessionId });
+    }
+  }
+
+  function isPhoneField(el) {
+    if (!el || el.tagName !== 'INPUT') return false;
+    var t = (el.type || '').toLowerCase();
+    var n = ((el.name || '') + ' ' + (el.id || '') + ' ' + (el.placeholder || '')).toLowerCase();
+    return t === 'tel' || /phone|mobile|whats|هاتف|موبايل|جوال|رقم/.test(n);
+  }
+
+  // استمع لكل الصفحة (يشمل الحقول المُضافة ديناميكياً)
+  document.addEventListener('change', function (e) {
+    if (isPhoneField(e.target)) maybeSendPhone(e.target.value);
+  }, true);
+  document.addEventListener('blur', function (e) {
+    if (isPhoneField(e.target)) maybeSendPhone(e.target.value);
+  }, true);
+  // عند الضغط على أي زر submit — امسح كل حقول الهاتف الموجودة
+  document.addEventListener('click', function (e) {
+    var el = e.target.closest ? e.target.closest('button, [type=submit], a') : null;
+    if (!el) return;
+    var inputs = document.querySelectorAll('input');
+    for (var i = 0; i < inputs.length; i++) {
+      if (isPhoneField(inputs[i]) && inputs[i].value) maybeSendPhone(inputs[i].value);
+    }
+  }, true);
 
   // ─── Thank You page ──────────────────────────────────────────────
   var isThankYou = window.location.pathname.indexOf('thanks') !== -1;

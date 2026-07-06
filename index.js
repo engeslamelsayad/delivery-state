@@ -124,7 +124,7 @@ setInterval(() => {
 }, 30 * 60 * 1000);
 
 const store = {
-  async setSignal(k, v)   { getRedis() ? await rSet(`sig:${k}`,    v, CONFIG.SIGNAL_TTL)    : mem.signals.set(k, v); },
+  async setSignal(k, v, ttl) { getRedis() ? await rSet(`sig:${k}`, v, ttl || CONFIG.SIGNAL_TTL) : mem.signals.set(k, v); },
   async getSignal(k)      { return getRedis() ? await rGet(`sig:${k}`)    : (mem.signals.get(k)  || null); },
   async delSignal(k)      { getRedis() ? await rDel(`sig:${k}`)           : mem.signals.delete(k); },
   async setOrder(id, v)   { getRedis() ? await rSet(`order:${id}`, v, CONFIG.ORDER_TTL)    : mem.orders.set(id, v); },
@@ -229,6 +229,18 @@ app.post('/link-session', async (req, res) => {
   res.json({ ok: true });
 });
 
+// ربط الهاتف بالجلسة — يُرسَل من header-script لحظة إدخال الهاتف في فورم الطلب
+app.post('/link-phone', async (req, res) => {
+  const { phone, sessionId } = req.body;
+  if (!phone || !sessionId) return res.status(400).json({ error: 'phone and sessionId required' });
+  const norm = normalizePhone(phone);
+  if (!norm || norm.length < 10) return res.status(400).json({ error: 'invalid phone' });
+  // TTL ساعة — كافية بين إدخال الهاتف ووصول الـ webhook
+  await store.setSignal('phonelink_' + norm, { sessionId, ts: Date.now() }, 60 * 60);
+  console.log(`[Link] phone ...${norm.slice(-4)} -> session ${sessionId.slice(-8)}`);
+  res.json({ ok: true });
+});
+
 // Easy Orders Webhook — يحدد المتجر من الـ secret
 app.post('/webhook/easy-orders', async (req, res) => {
   const secret = req.headers['secret'];
@@ -291,6 +303,19 @@ async function handleNewOrder(order, fromStore) {
   const linkRecord = await store.getSignal('link_' + order.id);
   const sessionId  = linkRecord?.sessionId || null;
   let signals      = sessionId ? (await store.getSignal(sessionId) || {}) : {};
+
+  // الأولوية ٢: مطابقة الهاتف — العميل أدخل هاتفه في الفورم وربطناه بجلسته
+  // (دقة ~100% لأن نفس الشخص كتب نفس الرقم اللي وصل في الـ webhook)
+  if (!signals.fbp && !signals.fbc && order.phone) {
+    const phoneLink = await store.getSignal('phonelink_' + normalizePhone(order.phone));
+    if (phoneLink?.sessionId) {
+      const s = await store.getSignal(phoneLink.sessionId);
+      if (s) {
+        signals = s;
+        console.log(`[Signals] phone-match: session ${phoneLink.sessionId.slice(-8)} (exact)`);
+      }
+    }
+  }
 
   // Fallback الآمن: نطابق بالوقت فقط لو فيه "زائر واحد بالضبط" في النافذة.
   // لو أكثر من زائر → نتجاهل (خطر ربط fbc زائر بطلب زائر آخر → attribution خاطئ في Meta)
