@@ -12,7 +12,7 @@
  * + Cross-domain sessionId via URL param
  */
 (function () {
-  var SERVER         = 'https://YOUR-SERVER.example.com';
+  var SERVER         = 'https://delivery-state.up.railway.app';
   var COOKIE_TTL     = 90;
   var POLL_INTERVAL  = 500;   // كل 500ms
   var POLL_MAX       = 8;   // أقصى 8 محاولات = 4 ثوانٍ
