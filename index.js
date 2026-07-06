@@ -79,7 +79,7 @@ app.use(express.json());
 app.get('/header-script.js', (req, res) => {
   res.setHeader('Content-Type',  'application/javascript');
   res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-  res.sendFile(path.join(__dirname, 'header-script.js'));
+  res.sendFile(path.join(__dirname, '..', 'public', 'header-script.js'));
 });
 
 app.use((req, res, next) => {
@@ -292,15 +292,24 @@ async function handleNewOrder(order, fromStore) {
   const sessionId  = linkRecord?.sessionId || null;
   let signals      = sessionId ? (await store.getSignal(sessionId) || {}) : {};
 
+  // Fallback الآمن: نطابق بالوقت فقط لو فيه "زائر واحد بالضبط" في النافذة.
+  // لو أكثر من زائر → نتجاهل (خطر ربط fbc زائر بطلب زائر آخر → attribution خاطئ في Meta)
   if (!signals.fbp && !signals.fbc) {
-    const cutoff = Date.now() - (3 * 60 * 1000);
-    let latest = null, latestTs = 0;
+    const cutoff = Date.now() - (2 * 60 * 1000);  // نافذة دقيقتين
+    const candidates = [];
     const allSigs = await store.getAllSignals();
     for (const { key, val } of allSigs) {
       if (key.startsWith('link_') || key.startsWith('bosta_') || key.startsWith('processed_')) continue;
-      if (val.ts && val.ts > cutoff && val.ts > latestTs) { latest = val; latestTs = val.ts; }
+      if (val.ts && val.ts > cutoff) candidates.push(val);
     }
-    if (latest) { signals = latest; console.log(`[Signals] time-match: ${Math.round((Date.now()-latestTs)/1000)}s ago`); }
+    if (candidates.length === 1) {
+      // زائر واحد فقط في آخر دقيقتين → غالباً هو صاحب الطلب
+      signals = candidates[0];
+      console.log(`[Signals] time-match (sole visitor): ${Math.round((Date.now()-candidates[0].ts)/1000)}s ago`);
+    } else if (candidates.length > 1) {
+      // زوار متعددون → لا نستطيع الجزم بمن صاحب الطلب → نتخطى الـ fbc/fbp
+      console.log(`[Signals] time-match skipped: ${candidates.length} concurrent visitors (ambiguous)`);
+    }
   }
 
   console.log(`[Signals] fbp:${signals.fbp?'v':'x'} fbc:${signals.fbc?'v':'x'} ip:${signals.clientIp?'v':'x'}`);
@@ -552,6 +561,16 @@ async function pollBostaDeliveries() {
 
 setInterval(pollBostaDeliveries, POLL_INTERVAL_MS);
 setTimeout(pollBostaDeliveries, 2 * 60 * 1000);
+
+// ══════════════════════════════════════════════════════════
+// GLOBAL ERROR HANDLER
+// ══════════════════════════════════════════════════════════
+app.use((err, req, res, next) => {
+  // العميل أغلق الاتصال قبل اكتمال الـ request (sendBeacon عند إغلاق الصفحة)
+  if (err.message === 'request aborted' || err.type === 'request.aborted') return;
+  console.error('[Error]', err.message);
+  if (!res.headersSent) res.status(500).json({ error: 'internal server error' });
+});
 
 // ══════════════════════════════════════════════════════════
 // START
