@@ -394,18 +394,24 @@ async function processBostaShipment(tracking, stateRaw, processedKey, prefetched
   if (!enrichment && bosta.phone) {
     const normPhone = normalizePhone(bosta.phone);
     const allOrders = await store.getAllOrders();
-    // اختر الأحدث لو موجود في أكثر من متجر
-    let latest = null, latestTs = 0;
+    // اختر الأوردر "الأقرب زمنياً" لتاريخ إنشاء الشحنة في Bosta —
+    // وليس الأحدث مطلقاً. عميل مكرر (طلب قديم + طلب جديد) كان يتسبب في
+    // ربط توصيلة الطلب القديم ببيانات الطلب الجديد (fbc حملة جديدة!)
+    // → attribution خاطئ في Meta.
+    const shipTs = bosta.creationDate ? new Date(bosta.creationDate).getTime() : Date.now();
+    let best = null, bestDiff = Infinity;
     for (const o of allOrders) {
       if (normalizePhone(o.phone) === normPhone) {
-        const ts = new Date(o.createdAt).getTime();
-        if (ts > latestTs) { latest = o; latestTs = ts; }
+        const ts   = new Date(o.createdAt).getTime();
+        const diff = Math.abs(ts - shipTs);
+        if (diff < bestDiff) { best = o; bestDiff = diff; }
       }
     }
-    if (latest) {
-      enrichment = latest; orderId = latest.orderId;
+    if (best) {
+      enrichment = best; orderId = best.orderId;
       await store.setTracking(tracking, orderId);
-      console.log(`[Match] by phone -> ${orderId.slice(-8)} (store ${latest.storeName})`);
+      const diffDays = Math.round(bestDiff / 86400000);
+      console.log(`[Match] by phone -> ${orderId.slice(-8)} (closest to shipment: ${diffDays}d, store ${best.storeName})`);
     }
   }
 
@@ -484,10 +490,24 @@ async function sendMetaEvent(eventName, bosta, enrichment, tracking, returnReaso
 
   const eventId = `${eventName.toLowerCase()}_${orderId}`;
 
+  // ── Attribution fix: event_time = وقت الطلب وليس وقت التسليم ──
+  // Meta تنسب الحدث لآخر تفاعل إعلاني قبل event_time.
+  // لو استخدمنا وقت التسليم (متأخر 2-5 أيام عن الطلب)، أي إعلان جديد
+  // تفاعل معه العميل بعد الطلب "يسرق" الـ attribution من الإعلان الأصلي.
+  // بإرجاع event_time لوقت الطلب، يُنسَب الـ Delivery لنفس الـ click
+  // الذي نُسِب له الـ Purchase — وهو الصحيح.
+  // (Meta تقبل event_time حتى 7 أيام للخلف — نحتاط بـ 6.5 يوم)
+  const orderTimeMs =
+    (enrichment?.createdAt   ? new Date(enrichment.createdAt).getTime()   : null) ||
+    (bosta.creationDate      ? new Date(bosta.creationDate).getTime()     : null) ||
+    Date.now();
+  const minAllowedMs = Date.now() - 6.5 * 24 * 60 * 60 * 1000;
+  const eventTimeSec = Math.floor(Math.max(orderTimeMs, minAllowedMs) / 1000);
+
   const payload = {
     data: [{
       event_name:    eventName,
-      event_time:    Math.floor(Date.now() / 1000),
+      event_time:    eventTimeSec,
       action_source: 'website',
       event_id:      eventId,
       user_data: {
