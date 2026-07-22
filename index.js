@@ -281,16 +281,28 @@ app.post('/webhook/bosta', async (req, res) => {
 
   if (!isDelivered(stateRaw) && !isReturned(stateRaw)) return;
 
-  const processedKey = `processed_${tracking}_${stateRaw}`;
-  if (await store.getSignal(processedKey)) { console.log(`[Bosta] already processed`); return; }
+  // مفتاح موحّد: Bosta قد ترسل الحالة رقماً (45) أو نصاً (DELIVERED)
+  // بدون التوحيد، نفس الشحنة تولّد مفتاحين مختلفين → حدث مكرر بعد 48 ساعة
+  const processedKey  = `processed_${tracking}_${stateKeyOf(stateRaw)}`;
+  const legacyKey     = `processed_${tracking}_${stateRaw}`;  // توافق مع مفاتيح ما قبل v7.3
+  if (await store.getSignal(processedKey) || await store.getSignal(legacyKey)) {
+    console.log(`[Bosta] already processed`); return;
+  }
 
   await processBostaShipment(tracking, stateRaw, processedKey);
 });
 
+// توحيد صيغة الحالة في مفتاح منع التكرار (رقم 45 == نص DELIVERED)
+function stateKeyOf(stateRaw) {
+  if (isDelivered(stateRaw)) return 'DELIVERED';
+  if (isReturned(stateRaw))  return 'RETURNED';
+  return String(stateRaw);
+}
+
 app.get('/health', async (req, res) => {
   res.json({
     ok: true,
-    version: '6.0-multi-store',
+    version: '7.3-attribution-fix',
     storage: getRedis() ? 'redis' : 'memory',
     stores:  STORES.map(s => ({ name: s.name, domains: s.domains.length, hasSecret: !!s.secret, hasPixel: !!s.pixelId })),
     orders: await store.orderCount(),
@@ -328,25 +340,11 @@ async function handleNewOrder(order, fromStore) {
     }
   }
 
-  // Fallback الآمن: نطابق بالوقت فقط لو فيه "زائر واحد بالضبط" في النافذة.
-  // لو أكثر من زائر → نتجاهل (خطر ربط fbc زائر بطلب زائر آخر → attribution خاطئ في Meta)
-  if (!signals.fbp && !signals.fbc) {
-    const cutoff = Date.now() - (2 * 60 * 1000);  // نافذة دقيقتين
-    const candidates = [];
-    const allSigs = await store.getAllSignals();
-    for (const { key, val } of allSigs) {
-      if (key.startsWith('link_') || key.startsWith('bosta_') || key.startsWith('processed_')) continue;
-      if (val.ts && val.ts > cutoff) candidates.push(val);
-    }
-    if (candidates.length === 1) {
-      // زائر واحد فقط في آخر دقيقتين → غالباً هو صاحب الطلب
-      signals = candidates[0];
-      console.log(`[Signals] time-match (sole visitor): ${Math.round((Date.now()-candidates[0].ts)/1000)}s ago`);
-    } else if (candidates.length > 1) {
-      // زوار متعددون → لا نستطيع الجزم بمن صاحب الطلب → نتخطى الـ fbc/fbp
-      console.log(`[Signals] time-match skipped: ${candidates.length} concurrent visitors (ambiguous)`);
-    }
-  }
+  // v7.3: أُلغي الـ time-match نهائياً.
+  // الربط الآن حصري بالطرق المؤكدة: link_ (صفحة الشكر) أو phonelink_ (هاتف الفورم).
+  // أي ربط تخميني بالوقت قد ينسب fbc زائر لطلب زائر آخر → تلوث attribution في Meta.
+  // طلب بدون ربط = يُرسَل ببيانات Bosta الحقيقية (phone+name+city) وMeta تطابقه
+  // بدقة مع لمسات صاحبه الفعلية — وهذا أصح من fbc مُخمَّن.
 
   console.log(`[Signals] fbp:${signals.fbp?'v':'x'} fbc:${signals.fbc?'v':'x'} ip:${signals.clientIp?'v':'x'}`);
 
@@ -596,8 +594,10 @@ async function pollBostaDeliveries() {
         // فقط الحالات النهائية تهمنا
         if (!isDelivered(state) && !isReturned(state)) continue;
 
-        const processedKey = `processed_${tracking}_${state}`;
-        if (await store.getSignal(processedKey)) continue;
+        // مفتاح موحّد + فحص المفتاح القديم (توافق مع ما قبل v7.3)
+        const processedKey = `processed_${tracking}_${stateKeyOf(state)}`;
+        const legacyKey    = `processed_${tracking}_${state}`;
+        if (await store.getSignal(processedKey) || await store.getSignal(legacyKey)) continue;
 
         // ✓ Optimization: نمرر بيانات Bosta من الـ list response مباشرة - بدون API call إضافي
         const bostaData = extractBostaData(d, tracking);
@@ -634,7 +634,7 @@ app.use((err, req, res, next) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`\n╔════════════════════════════════════════════╗`);
-  console.log(`║   COD Meta Tracking v7.1 — Optimized      ║`);
+  console.log(`║   COD Meta Tracking v7.3 — Attribution   ║`);
   console.log(`╠════════════════════════════════════════════╣`);
   console.log(`║  Port    : ${String(PORT).padEnd(32)}║`);
   console.log(`║  Storage : ${(getRedis() ? 'Redis ✓' : 'Memory ⚠').padEnd(32)}║`);
